@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>WOL Controller</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: { sans: ["Inter", "sans-serif"] },
+            boxShadow: {
+              glow: "0 0 20px rgba(16, 185, 129, 0.5)",
+              "glow-red": "0 0 20px rgba(239, 68, 68, 0.4)",
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap");
+      body {
+        -webkit-tap-highlight-color: transparent;
+      }
+      .log-panel {
+        background: rgba(241, 245, 249, 0.9);
+        border: 1px solid rgba(226, 232, 240, 0.8);
+      }
+      @keyframes pulse-ring {
+        0% {
+          box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+        }
+        70% {
+          box-shadow: 0 0 0 15px rgba(16, 185, 129, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+        }
+      }
+      .status-online-active .icon-container {
+        animation: pulse-ring 2s infinite;
+      }
+      @keyframes shake {
+        0%,
+        100% {
+          transform: translateX(0);
+        }
+        10%,
+        30%,
+        50%,
+        70%,
+        90% {
+          transform: translateX(-5px);
+        }
+        20%,
+        40%,
+        60%,
+        80% {
+          transform: translateX(5px);
+        }
+      }
+      .error-shake {
+        animation: shake 0.5s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+      }
+    </style>
+    <script>
+      const CONFIG = {
+        broker: "broker.hivemq.com",
+        port: 8884,
+        baseTopic: "remotewol/",
+        secret: "YOUR_LONG_COMPLEX_SECRET_KEY_HERE",
+      };
+
+      const MAX_RETRIES = 12;
+      let client;
+      let currentTopicString = "";
+      let pollInterval;
+      let pollAttempts = 0;
+      let heartbeatInterval;
+      let pongTimeout;
+
+      function log(msg, type = "info") {
+        const consoleDiv = document.getElementById("console-logs");
+        const time = new Date().toLocaleTimeString([], {
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+        let colorClass = "text-slate-600";
+        let borderClass = "border-l-2 border-slate-300";
+        if (type === "error") {
+          colorClass = "text-red-600 font-bold";
+          borderClass = "border-l-2 border-red-500";
+        }
+        if (type === "success") {
+          colorClass = "text-emerald-600 font-bold";
+          borderClass = "border-l-2 border-emerald-500";
+        }
+        if (type === "stats") {
+          colorClass = "text-blue-600 font-mono text-[10px]";
+          borderClass = "border-l-2 border-blue-500";
+        }
+        consoleDiv.innerHTML += `
+                <div class="mb-2 pl-2 ${borderClass} flex flex-col animate-[fadeIn_0.2s_ease-out]">
+                    <span class="text-[9px] font-mono opacity-60 text-slate-500">${time}</span>
+                    <span class="text-[11px] leading-tight ${colorClass}">${msg}</span>
+                </div>`;
+        consoleDiv.scrollTop = consoleDiv.scrollHeight;
+      }
+
+      function getUtcTopic() {
+        const now = new Date();
+        const y = now.getUTCFullYear();
+        const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+        const d = String(now.getUTCDate()).padStart(2, "0");
+        const h = String(now.getUTCHours()).padStart(2, "0");
+        return `${CONFIG.baseTopic}${y}${m}${d}${h}`;
+      }
+
+      function generatePayload(cmd) {
+        const ts = Math.floor(Date.now() / 1000).toString();
+        const raw = cmd + ts;
+        const sig = CryptoJS.HmacSHA256(raw, CONFIG.secret).toString(
+          CryptoJS.enc.Hex,
+        );
+        return `${cmd}|${ts}|${sig}`;
+      }
+
+      function connect() {
+        const clientId = "web-" + new Date().getTime();
+        log(`Initializing secure connection...`);
+        updateConnectionStatus("connecting");
+        client = new Paho.MQTT.Client(CONFIG.broker, CONFIG.port, clientId);
+        client.onConnectionLost = onConnectionLost;
+        client.onMessageArrived = onMessageArrived;
+        client.connect({
+          onSuccess: onConnect,
+          onFailure: onFailure,
+          useSSL: true,
+          timeout: 5,
+        });
+      }
+
+      function onConnect() {
+        updateConnectionStatus("connected");
+        log("Broker Connected.", "success");
+        currentTopicString = getUtcTopic();
+        client.subscribe(currentTopicString + "/response");
+        log("Stabilizing connection (2s)...");
+        setTimeout(() => {
+          startStatusPolling();
+          startHeartbeatLoop();
+        }, 2000);
+      }
+
+      function onFailure(responseObject) {
+        updateConnectionStatus("disconnected");
+        log(`Connection Failed: ${responseObject.errorMessage}`, "error");
+      }
+
+      function onConnectionLost(responseObject) {
+        updateConnectionStatus("disconnected");
+        if (responseObject.errorCode !== 0) {
+          log(`Connection Drop: ${responseObject.errorMessage}`, "error");
+        }
+        clearInterval(pollInterval);
+        clearInterval(heartbeatInterval);
+      }
+
+      function onMessageArrived(message) {
+        const payload = message.payloadString;
+        if (message.destinationName.includes("/response")) {
+          if (payload === "PONG") {
+            clearTimeout(pongTimeout);
+            updateEspLinkStatus(true);
+            return;
+          }
+          if (payload.startsWith("{")) {
+            try {
+              const stats = JSON.parse(payload);
+              const uptimeHrs = (stats.uptime / 3600).toFixed(1);
+              const freeMemKb = (stats.mem_free / 1024).toFixed(1);
+              log(
+                `[ESP32] Up: ${uptimeHrs}h | Free: ${freeMemKb}kB | Sig: ${stats.rssi}dBm`,
+                "stats",
+              );
+            } catch (e) {
+              log("Raw Stats: " + payload, "info");
+            }
+            return;
+          }
+          clearInterval(pollInterval);
+          pollAttempts = 0;
+          updatePcStatus(payload);
+          log(
+            `Status update: ${payload}`,
+            payload === "ONLINE" ? "success" : "info",
+          );
+        }
+      }
+
+      function startHeartbeatLoop() {
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+        sendPing();
+        heartbeatInterval = setInterval(sendPing, 30000);
+      }
+
+      function sendPing() {
+        if (!client.isConnected()) return;
+        publish("PING");
+        if (pongTimeout) clearTimeout(pongTimeout);
+        pongTimeout = setTimeout(() => {
+          updateEspLinkStatus(false);
+          log("ESP32 Heartbeat Missed", "error");
+        }, 5000);
+      }
+
+      function updateEspLinkStatus(isAlive) {
+        const dot = document.getElementById("status-dot");
+        const text = document.getElementById("status-text");
+        if (isAlive) {
+          dot.className =
+            "w-2 h-2 rounded-full transition-all duration-300 bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]";
+          text.innerText = "LINK ACTIVE";
+          text.className =
+            "text-[10px] font-bold tracking-widest text-emerald-600";
+        } else {
+          dot.className =
+            "w-2 h-2 rounded-full transition-all duration-300 bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]";
+          text.innerText = "ESP32 LOST";
+          text.className = "text-[10px] font-bold tracking-widest text-red-600";
+        }
+      }
+
+      function startStatusPolling() {
+        if (!client.isConnected()) return;
+        if (pollInterval) clearInterval(pollInterval);
+        pollAttempts = 0;
+        performStatusCheck();
+        pollInterval = setInterval(performStatusCheck, 10000);
+      }
+
+      function performStatusCheck() {
+        if (!client.isConnected()) {
+          clearInterval(pollInterval);
+          return;
+        }
+        if (pollAttempts >= MAX_RETRIES) {
+          clearInterval(pollInterval);
+          updatePcStatus("ESP_ERROR");
+          log("Target PC Unreachable (Max Retries)", "error");
+          return;
+        }
+        pollAttempts++;
+        publish("STATUS");
+      }
+
+      function executeWol() {
+        if (!client.isConnected()) return;
+        log("Transmitting Wake-on-LAN...", "success");
+        publish("WAKE");
+        const btn = document.getElementById("btn-wake");
+        btn.classList.add("scale-[0.98]", "opacity-90");
+        setTimeout(() => {
+          btn.classList.remove("scale-[0.98]", "opacity-90");
+          startStatusPolling();
+        }, 500);
+      }
+
+      function requestUsage() {
+        if (!client.isConnected()) return;
+        log("Requesting System Metrics...", "info");
+        publish("USAGE");
+      }
+
+      function publish(cmd) {
+        const payload = generatePayload(cmd);
+        message = new Paho.MQTT.Message(payload);
+        message.destinationName = currentTopicString;
+        client.send(message);
+      }
+
+      function updateConnectionStatus(status) {
+        const dot = document.getElementById("status-dot");
+        const text = document.getElementById("status-text");
+        dot.className = "w-2 h-2 rounded-full transition-all duration-300";
+        if (status === "connected") {
+          dot.classList.add("bg-amber-500");
+          text.innerText = "WAITING LINK";
+          text.className =
+            "text-[10px] font-bold tracking-widest text-amber-600";
+        } else if (status === "connecting") {
+          dot.classList.add("bg-amber-500", "animate-pulse");
+          text.innerText = "CONNECTING";
+          text.className =
+            "text-[10px] font-bold tracking-widest text-amber-600";
+          toggleWakeButton(false, "ESTABLISHING LINK...");
+        } else {
+          dot.classList.add("bg-red-500");
+          text.innerText = "OFFLINE";
+          text.className = "text-[10px] font-bold tracking-widest text-red-600";
+          toggleWakeButton(false, "NO CONNECTION");
+        }
+      }
+
+      function updatePcStatus(status) {
+        const card = document.getElementById("status-card");
+        const iconContainer = document.querySelector(".icon-container");
+        const statusValue = document.getElementById("pc-status-value");
+        card.classList.remove("status-online-active", "error-shake");
+        if (status === "ESP_ERROR") {
+          card.classList.add("error-shake");
+          iconContainer.className =
+            "icon-container w-32 h-32 rounded-3xl border-2 flex items-center justify-center transition-all duration-500 shadow-xl bg-red-500/10 text-red-500 border-red-500/50";
+          statusValue.innerHTML = "TIMEOUT";
+          statusValue.className =
+            "text-4xl font-black text-red-500 tracking-tighter";
+          toggleWakeButton(false, "CONTROLLER OFFLINE");
+        } else if (status === "ONLINE") {
+          card.classList.add("status-online-active");
+          iconContainer.className =
+            "icon-container w-32 h-32 rounded-3xl border-2 flex items-center justify-center transition-all duration-500 shadow-xl bg-emerald-500/10 text-emerald-500 border-emerald-500/50";
+          statusValue.innerHTML = "ONLINE";
+          statusValue.className =
+            "text-4xl font-black text-slate-800 tracking-tighter drop-shadow-sm";
+          toggleWakeButton(false, "SYSTEM IS ONLINE");
+        } else {
+          iconContainer.className =
+            "icon-container w-32 h-32 rounded-3xl border-2 flex items-center justify-center transition-all duration-500 shadow-xl bg-white text-slate-300 border-slate-200";
+          statusValue.innerHTML = "OFFLINE";
+          statusValue.className =
+            "text-4xl font-black text-slate-400 tracking-tighter";
+          if (client && client.isConnected()) {
+            toggleWakeButton(true, "POWER ON SYSTEM");
+          }
+        }
+      }
+
+      function toggleWakeButton(enable, text) {
+        const btn = document.getElementById("btn-wake");
+        const btnText = document.getElementById("btn-text");
+        const btnIcon = document.getElementById("btn-icon");
+        btnText.innerText = text;
+        if (enable) {
+          btn.disabled = false;
+          btn.classList.remove("opacity-50", "cursor-not-allowed", "grayscale");
+          btn.classList.add("shadow-glow", "active:scale-95");
+          btnIcon.classList.remove("hidden");
+        } else {
+          btn.disabled = true;
+          btn.classList.add("opacity-50", "cursor-not-allowed", "grayscale");
+          btn.classList.remove("shadow-glow", "active:scale-95");
+          btnIcon.classList.add("hidden");
+        }
+      }
+
+      window.onload = connect;
+    </script>
+  </head>
+  <body
+    class="bg-slate-50 h-[100dvh] w-full overflow-hidden text-slate-800 font-sans"
+  >
+    <div
+      class="absolute top-0 left-0 w-full h-full overflow-hidden -z-10 pointer-events-none"
+    >
+      <div
+        class="absolute top-[-10%] right-[-20%] w-[400px] h-[400px] bg-emerald-300/30 rounded-full blur-[80px]"
+      ></div>
+      <div
+        class="absolute bottom-[-10%] left-[-20%] w-[300px] h-[300px] bg-blue-300/30 rounded-full blur-[80px]"
+      ></div>
+    </div>
+    <main
+      class="h-full max-w-lg mx-auto p-6 flex flex-col justify-between relative z-10"
+    >
+      <header class="flex justify-between items-center pt-2">
+        <div>
+          <h1
+            class="text-2xl font-black tracking-tight flex items-center gap-1 text-slate-800"
+          >
+            WOL
+            <div class="w-1.5 h-1.5 bg-emerald-500 rounded-full mt-3"></div>
+            <span class="font-light opacity-60">Mobile</span>
+          </h1>
+          <div class="flex items-center gap-2 mt-1">
+            <div
+              id="status-dot"
+              class="w-2 h-2 rounded-full bg-slate-300"
+            ></div>
+            <span
+              id="status-text"
+              class="text-[10px] font-bold tracking-widest text-slate-400 uppercase"
+              >Init...</span
+            >
+          </div>
+        </div>
+        <button
+          onclick="requestUsage()"
+          class="p-2 rounded-full bg-white/50 border border-slate-200 shadow-sm active:scale-95 transition-all text-slate-400 hover:text-blue-500"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            class="h-5 w-5"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+            />
+          </svg>
+        </button>
+      </header>
+      <section
+        id="status-card"
+        class="flex-1 flex flex-col items-center justify-center gap-6 my-6 transition-all duration-500"
+      >
+        <div
+          class="icon-container w-32 h-32 rounded-3xl border-2 border-slate-200 bg-white flex items-center justify-center text-slate-300 transition-all duration-500 shadow-xl"
+        >
+          <svg
+            id="pc-icon"
+            xmlns="http://www.w3.org/2000/svg"
+            class="h-16 w-16"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            stroke-width="1.5"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+            />
+          </svg>
+        </div>
+        <div class="text-center">
+          <p class="text-xs font-bold text-slate-400 tracking-[0.2em] mb-1">
+            CURRENT STATUS
+          </p>
+          <h2
+            id="pc-status-value"
+            class="text-4xl font-black text-slate-400 tracking-tighter transition-all duration-300"
+          >
+            WAITING
+          </h2>
+        </div>
+      </section>
+      <div class="flex flex-col gap-4">
+        <button
+          id="btn-wake"
+          onclick="executeWol()"
+          disabled
+          class="w-full h-16 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-400 text-white shadow-lg flex items-center justify-center gap-3 transition-all duration-300 disabled:opacity-50 disabled:grayscale hover:shadow-emerald-200"
+        >
+          <svg
+            id="btn-icon"
+            xmlns="http://www.w3.org/2000/svg"
+            class="h-6 w-6 hidden animate-bounce"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="2"
+              d="M13 10V3L4 14h7v7l9-11h-7z"
+            />
+          </svg>
+          <span id="btn-text" class="font-bold tracking-wide text-lg"
+            >CONNECTING...</span
+          >
+        </button>
+        <div class="relative">
+          <div class="flex justify-between items-end mb-2 px-1">
+            <span
+              class="text-[9px] font-bold text-slate-400 uppercase tracking-widest"
+              >Event Log</span
+            >
+            <button
+              onclick="startStatusPolling()"
+              class="text-[9px] text-emerald-600 font-bold hover:underline"
+            >
+              CHECK NOW
+            </button>
+          </div>
+          <div
+            id="console-logs"
+            class="log-panel h-32 rounded-xl p-3 overflow-y-auto scrollbar-hide text-slate-600"
+          ></div>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>
