@@ -1,13 +1,12 @@
-name: Deploy static content to Pages
+name: Deploy and Release
 
 on:
   push:
     branches: ["main"]
-
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -16,7 +15,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.compare.outputs.match }}
+      version: ${{ steps.vars.outputs.version_config }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract Versions
+        id: vars
+        run: |
+          VERSION_CONFIG=$(grep "VERSION =" config.py | cut -d'"' -f2)
+          VERSION_CHANGELOG=$(grep -m 1 "## \[" changelog.md | sed -E 's/.*\[([^]]+)\].*/\1/')
+          echo "version_config=$VERSION_CONFIG" >> $GITHUB_OUTPUT
+          echo "version_changelog=$VERSION_CHANGELOG" >> $GITHUB_OUTPUT
+
+      - name: Compare Versions
+        id: compare
+        run: |
+          if [ "${{ steps.vars.outputs.version_config }}" == "${{ steps.vars.outputs.version_changelog }}" ]; then
+            echo "match=true" >> $GITHUB_OUTPUT
+          else
+            echo "match=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.should_deploy == 'true'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -24,12 +51,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Create Release Package
+        run: |
+          zip -r esp32-wol-v${{ needs.check-version.outputs.version }}.zip . -x "*.git*" ".github*" "concat.ps1" "full_project_context.md"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: Release v${{ needs.check-version.outputs.version }}
+          files: esp32-wol-v${{ needs.check-version.outputs.version }}.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: "."
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
