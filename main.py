@@ -1,17 +1,18 @@
 import _thread
 import gc
+import json
 import time
 
 import machine
 from umqtt.robust import MQTTClient
 
 import config
-from utils import CryptoManager, SystemTools, WOLService
+from utils import CryptoManager, ScheduleManager, SystemTools, WOLService
 
 
-class LEDController:
+class BackgroundService:
     """
-    <summary>Handles LED blinking on Core 0 thread to ensure smooth pulses.</summary>
+    <summary>Runs on Core 0. Handles LED blinking and Schedule checks.</summary>
     """
 
     BOOT = 100
@@ -21,45 +22,63 @@ class LEDController:
     IDLE_OFF = 4000
 
     def __init__(self):
-        self.enabled = config.LED_SIGNALS
-        self.pin = None
+        self.enabled_led = config.LED_SIGNALS
+        self.led_pin = None
         self.mode = self.BOOT
         self.state = 0
-        if self.enabled:
+        self.last_wake_min = -1
+
+        if self.enabled_led:
             try:
-                self.pin = machine.Pin(config.LED_PIN, machine.Pin.OUT)
-                self.pin.value(0)
+                self.led_pin = machine.Pin(config.LED_PIN, machine.Pin.OUT)
+                self.led_pin.value(0)
             except:
-                self.enabled = False
+                self.enabled_led = False
 
     def set_mode(self, mode):
         self.mode = mode
 
     def flash(self, count):
-        if not self.enabled:
+        if not self.enabled_led:
             return
         for _ in range(count):
-            self.pin.value(1)
+            self.led_pin.value(1)
             time.sleep(0.05)
-            self.pin.value(0)
+            self.led_pin.value(0)
             time.sleep(0.05)
 
     def _run_thread(self):
-        last_tick = 0
+        last_led_tick = 0
+        last_sched_tick = 0
+
         while True:
-            if not self.enabled:
-                time.sleep(2)
-                continue
-
             now = time.ticks_ms()
-            interval = self.mode
-            if self.mode in [self.IDLE_ON, self.IDLE_OFF]:
-                interval = self.IDLE_ON if self.state == 1 else self.IDLE_OFF
 
-            if time.ticks_diff(now, last_tick) > interval:
-                self.state = 1 - self.state
-                self.pin.value(self.state)
-                last_tick = now
+            if self.enabled_led:
+                interval = self.mode
+                if self.mode in [self.IDLE_ON, self.IDLE_OFF]:
+                    interval = self.IDLE_ON if self.state == 1 else self.IDLE_OFF
+
+                if time.ticks_diff(now, last_led_tick) > interval:
+                    self.state = 1 - self.state
+                    self.led_pin.value(self.state)
+                    last_led_tick = now
+
+            if time.ticks_diff(now, last_sched_tick) > 10000:
+                last_sched_tick = now
+                try:
+                    t = time.gmtime()
+                    current_min = t[4]
+
+                    if current_min != self.last_wake_min:
+                        if ScheduleManager.should_wake():
+                            print("[SCHED] Triggering Auto-Wake")
+                            WOLService.send_magic_packet()
+                            self.flash(3)
+                            self.last_wake_min = current_min
+                except Exception as e:
+                    print("[SCHED] Thread Error:", e)
+
             time.sleep(0.05)
 
     def start(self):
@@ -72,7 +91,7 @@ class WOLApp:
     """
 
     def __init__(self):
-        self.led = LEDController()
+        self.service = BackgroundService()
         self.crypto = CryptoManager()
         self.client = None
         self.current_topic = ""
@@ -92,18 +111,21 @@ class WOLApp:
             self.wdt.feed()
 
     def _on_message(self, topic, msg):
-        self.led.flash(1)
+        self.service.flash(1)
         try:
             decrypted = self.crypto.decrypt(msg.decode())
             if not decrypted:
                 return
 
             parts = decrypted.split("|")
-            if len(parts) != 3:
+            if len(parts) < 3:
                 return
 
-            cmd, ts, sig = parts[0], parts[1], parts[2]
-            if not self.crypto.verify_signature(cmd, ts, sig):
+            cmd_content = "|".join(parts[:-2])
+            ts = parts[-2]
+            sig = parts[-1]
+
+            if not self.crypto.verify_signature(cmd_content, ts, sig):
                 return
 
             current_ts = time.time() + 946684800
@@ -111,25 +133,38 @@ class WOLApp:
                 print(f"[ERR] Time skew: {abs(current_ts - int(ts))}s")
                 return
 
-            print(f"[OK] Cmd: {cmd}")
             resp_topic = self.current_topic + "/response"
 
-            if cmd == "WAKE":
+            is_json = cmd_content.startswith("{")
+            command = cmd_content if not is_json else "JSON_CMD"
+
+            if command == "WAKE":
+                print("[OK] Manual Wake")
                 WOLService.send_magic_packet()
-                self.led.flash(3)
-            elif cmd == "STATUS":
+                self.service.flash(3)
+            elif command == "STATUS":
                 status = (
                     "ONLINE" if WOLService.ping_device(config.WOL_IP) else "OFFLINE"
                 )
                 self._publish(resp_topic, status)
-                self.led.flash(2)
-            elif cmd == "PING":
+                self.service.flash(2)
+            elif command == "PING":
                 self._publish(resp_topic, "PONG")
-                self.led.flash(1)
-            elif cmd == "USAGE":
+            elif command == "USAGE":
                 metrics = SystemTools.get_metrics(self.start_time)
                 self._publish(resp_topic, metrics)
-                self.led.flash(2)
+            elif command == "GET_SCHED":
+                data = ScheduleManager.load_schedule()
+                self._publish(resp_topic, json.dumps(data))
+            elif is_json:
+                try:
+                    payload = json.loads(cmd_content)
+                    if payload.get("cmd") == "SET_SCHED":
+                        if ScheduleManager.save_schedule(payload.get("data")):
+                            self._publish(resp_topic, "SCHED_SAVED")
+                            print("[SCHED] Updated")
+                except ValueError:
+                    pass
 
         except Exception as e:
             print("[ERR] Callback error:", e)
@@ -141,7 +176,7 @@ class WOLApp:
 
     def _connect_mqtt(self):
         print(f"[MQTT] Connecting to {config.MQTT_BROKER}...")
-        self.led.set_mode(LEDController.CONNECTING)
+        self.service.set_mode(BackgroundService.CONNECTING)
         self.client = MQTTClient(
             config.MQTT_CLIENT_ID,
             config.MQTT_BROKER,
@@ -153,11 +188,11 @@ class WOLApp:
         self.current_topic = SystemTools.get_dynamic_topic()
         self.client.subscribe(self.current_topic)
         print(f"[MQTT] Subscribed: {self.current_topic}")
-        self.led.set_mode(LEDController.IDLE_ON)
+        self.service.set_mode(BackgroundService.IDLE_ON)
 
     def run(self):
-        print(f"--- ESP32 SECURE WOL v{config.VERSION} ---")
-        self.led.start()
+        print(f"--- ESP32 WOL v{config.VERSION} ---")
+        self.service.start()
         self._setup_wdt()
         gc.enable()
 
@@ -173,7 +208,7 @@ class WOLApp:
             self._connect_mqtt()
         except Exception as e:
             print("[CRIT] Init Error:", e)
-            self.led.set_mode(LEDController.ERROR)
+            self.service.set_mode(BackgroundService.ERROR)
             time.sleep(10)
             machine.reset()
 
@@ -206,7 +241,7 @@ class WOLApp:
 
             except Exception as e:
                 print(f"[ERR] Runtime Loop: {e}")
-                self.led.set_mode(LEDController.ERROR)
+                self.service.set_mode(BackgroundService.ERROR)
                 time.sleep(10)
                 machine.reset()
 

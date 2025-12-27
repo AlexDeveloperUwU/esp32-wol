@@ -70,9 +70,12 @@
         background: rgba(100, 116, 139, 0.2);
         border-radius: 10px;
       }
+      input[type="time"]::-webkit-calendar-picker-indicator {
+        filter: invert(0.5);
+      }
     </style>
     <script>
-      const APP_VERSION = "1.2.0";
+      const APP_VERSION = "1.3.0";
       const CONFIG = {
         broker: "broker.hivemq.com",
         port: 8884,
@@ -91,12 +94,22 @@
       let DEVICE_SERIAL = "";
       let SECRET_KEY = "";
 
+      const DAYS = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+      ];
+
       function loadCredentials() {
         DEVICE_SERIAL = localStorage.getItem("wol_serial") || "";
         SECRET_KEY = localStorage.getItem("wol_secret") || "";
 
         if (!DEVICE_SERIAL || !SECRET_KEY) {
-          showScreen("settings");
+          showScreen("setup");
         } else {
           document.getElementById("input-serial").value = DEVICE_SERIAL;
           document.getElementById("input-secret").value = SECRET_KEY;
@@ -128,11 +141,11 @@
 
         if (isError) {
           toast.className =
-            "fixed top-6 left-1/2 -translate-x-1/2 z-50 bg-red-500 text-white px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-in-down";
+            "fixed top-6 left-1/2 -translate-x-1/2 z-[60] bg-red-500 text-white px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-in-down";
           toastIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd" /></svg>`;
         } else {
           toast.className =
-            "fixed top-6 left-1/2 -translate-x-1/2 z-50 bg-slate-800 text-white px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-in-down";
+            "fixed top-6 left-1/2 -translate-x-1/2 z-[60] bg-slate-800 text-white px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-in-down";
           toastIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>`;
         }
 
@@ -142,15 +155,20 @@
         }, 3000);
       }
 
-      function openModal() {
-        const overlay = document.getElementById("modal-overlay");
-        overlay.classList.remove("hidden");
-        overlay.classList.remove("animate-fade-out");
-        overlay.classList.add("animate-fade-in");
+      function openSettings() {
+        document.getElementById("modal-settings").classList.remove("hidden");
+        document
+          .getElementById("modal-settings")
+          .classList.remove("animate-fade-out");
+        document
+          .getElementById("modal-settings")
+          .classList.add("animate-fade-in");
+        renderScheduleInputs();
+        getScheduleFromDevice();
       }
 
-      function closeModal() {
-        const overlay = document.getElementById("modal-overlay");
+      function closeSettings() {
+        const overlay = document.getElementById("modal-settings");
         overlay.classList.remove("animate-fade-in");
         overlay.classList.add("animate-fade-out");
         setTimeout(() => {
@@ -166,7 +184,7 @@
 
       function showScreen(name) {
         document.getElementById("screen-app").classList.add("hidden");
-        document.getElementById("screen-settings").classList.add("hidden");
+        document.getElementById("screen-setup").classList.add("hidden");
         document.getElementById(`screen-${name}`).classList.remove("hidden");
       }
 
@@ -240,13 +258,13 @@
         }
       }
 
-      function generateSignedCommand(cmd) {
+      function generateSignedCommand(cmd, extra = "") {
         const ts = Math.floor(Date.now() / 1000).toString();
         const raw = cmd + ts;
         const sig = CryptoJS.HmacSHA256(raw, SECRET_KEY).toString(
           CryptoJS.enc.Hex,
         );
-        return `${cmd}|${ts}|${sig}`;
+        return `${cmd}|${ts}|${sig}|${extra}`;
       }
 
       function connect() {
@@ -282,13 +300,23 @@
               clearTimeout(pongTimeout);
               updateEspStatus(true);
             } else if (payload.startsWith("{")) {
-              const s = JSON.parse(payload);
-              const ram = Math.round(s.mem_free / 1024);
-              const disk = Math.round(s.disk_free / 1024);
-              log(
-                `Stats: RSSI ${s.rssi}dBm | Uptime ${Math.round(s.uptime / 3600)}h | CPU ${s.cpu_freq}MHz (${s.cores} Cores) | RAM ${ram}KB | Disk ${disk}KB`,
-                "stats",
-              );
+              try {
+                const s = JSON.parse(payload);
+                // Check if it is a Schedule JSON or Stats JSON
+                if ("tz" in s) {
+                  populateScheduleUI(s);
+                  log("Schedule synchronized", "success");
+                } else {
+                  const ram = Math.round(s.mem_free / 1024);
+                  const disk = Math.round(s.disk_free / 1024);
+                  log(
+                    `Stats: RSSI ${s.rssi}dBm | Uptime ${Math.round(s.uptime / 3600)}h | RAM ${ram}KB`,
+                    "stats",
+                  );
+                }
+              } catch (e) {
+                log("Parse error: " + e, "error");
+              }
             } else {
               updatePCStatus(payload);
               log(
@@ -374,6 +402,76 @@
         client.send(msg);
       }
 
+      function getScheduleFromDevice() {
+        if (!client || !client.isConnected()) return;
+        const plain = generateSignedCommand("GET_SCHED");
+        const msg = new Paho.MQTT.Message(encryptPayload(plain));
+        msg.destinationName = currentTopicString;
+        client.send(msg);
+      }
+
+      function saveScheduleToDevice() {
+        const tz = parseInt(document.getElementById("sched-tz").value);
+        const days = [];
+        for (let i = 0; i < 7; i++) {
+          const enabled = document.getElementById(`sched-en-${i}`).checked;
+          const timeVal = document.getElementById(`sched-time-${i}`).value;
+          days.push(enabled ? timeVal : "");
+        }
+
+        const payloadObj = { tz: tz, days: days };
+        const jsonStr = JSON.stringify(payloadObj);
+        const plain = generateSignedCommand("SET_SCHED", jsonStr);
+        const msg = new Paho.MQTT.Message(encryptPayload(plain));
+        msg.destinationName = currentTopicString;
+        client.send(msg);
+        log("Saving schedule...", "info");
+        showToast("Schedule sent to device");
+      }
+
+      function renderScheduleInputs() {
+        const container = document.getElementById("schedule-rows");
+        container.innerHTML = "";
+
+        DAYS.forEach((day, i) => {
+          const row = document.createElement("div");
+          row.className = "flex items-center justify-between p-2";
+          row.innerHTML = `
+                <div class="flex items-center gap-3">
+                    <input type="checkbox" id="sched-en-${i}" onchange="toggleTimeInput(${i})" class="w-5 h-5 accent-emerald-500 rounded focus:ring-emerald-500">
+                    <span class="text-sm font-bold text-slate-600 dark:text-slate-300 w-24">${day}</span>
+                </div>
+                <input type="time" id="sched-time-${i}" disabled class="bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 rounded-lg px-3 py-1 text-sm font-mono border border-slate-200 dark:border-slate-700 disabled:opacity-30 disabled:cursor-not-allowed outline-none focus:border-emerald-500">
+            `;
+          container.appendChild(row);
+        });
+      }
+
+      function toggleTimeInput(idx) {
+        const cb = document.getElementById(`sched-en-${idx}`);
+        const inp = document.getElementById(`sched-time-${idx}`);
+        inp.disabled = !cb.checked;
+        if (cb.checked && !inp.value) inp.value = "09:00";
+      }
+
+      function populateScheduleUI(data) {
+        if (!data) return;
+        document.getElementById("sched-tz").value = data.tz;
+        data.days.forEach((timeStr, i) => {
+          const cb = document.getElementById(`sched-en-${i}`);
+          const inp = document.getElementById(`sched-time-${i}`);
+          if (timeStr && timeStr.length > 0) {
+            cb.checked = true;
+            inp.disabled = false;
+            inp.value = timeStr;
+          } else {
+            cb.checked = false;
+            inp.disabled = true;
+            inp.value = "";
+          }
+        });
+      }
+
       function updateBrokerStatus(s) {
         const el = document.getElementById("ind-broker");
         if (el)
@@ -438,37 +536,126 @@
       <span id="toast-msg" class="font-bold text-sm"></span>
     </div>
 
+    <!-- SETTINGS MODAL -->
     <div
-      id="modal-overlay"
-      class="fixed inset-0 z-50 bg-slate-900/40 dark:bg-black/60 backdrop-blur-sm hidden flex items-center justify-center p-6 animate-fade-in"
+      id="modal-settings"
+      class="fixed inset-0 z-50 bg-slate-900/40 dark:bg-black/60 backdrop-blur-sm hidden flex items-center justify-center p-4 animate-fade-in"
     >
       <div
-        class="bg-white dark:bg-slate-900 w-full max-w-sm rounded-3xl p-6 shadow-2xl border border-slate-100 dark:border-slate-800 animate-in-up"
+        class="bg-white dark:bg-slate-900 w-full max-w-lg rounded-3xl p-6 shadow-2xl border border-slate-100 dark:border-slate-800 animate-in-up flex flex-col max-h-[90vh]"
       >
-        <h3 class="text-xl font-black tracking-tight mb-2">Reset Settings?</h3>
-        <p class="text-sm text-slate-500 dark:text-slate-400 mb-6 font-medium">
-          This will clear your stored serial number and secret key. You will
-          need to enter them again.
-        </p>
-        <div class="flex gap-3">
+        <div class="flex justify-between items-center mb-6">
+          <h3 class="text-xl font-black tracking-tight">System Settings</h3>
           <button
-            onclick="closeModal()"
-            class="flex-1 py-3 rounded-xl bg-slate-100 dark:bg-slate-800 font-bold text-slate-500 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+            onclick="closeSettings()"
+            class="p-2 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
           >
-            Cancel
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              class="h-6 w-6"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M6 18L18 6M6 6l12 12"
+              />
+            </svg>
           </button>
-          <button
-            onclick="confirmReset()"
-            class="flex-1 py-3 rounded-xl bg-red-500 font-bold text-white hover:bg-red-600 transition-colors shadow-lg shadow-red-500/20"
-          >
-            Confirm
-          </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto pr-2 space-y-8">
+          <!-- SECTION: SCHEDULE -->
+          <div>
+            <div class="flex items-center justify-between mb-4">
+              <h4
+                class="text-xs font-bold text-emerald-500 uppercase tracking-widest"
+              >
+                Weekly Schedule
+              </h4>
+              <button
+                onclick="saveScheduleToDevice()"
+                class="text-xs font-bold bg-emerald-500 text-white px-3 py-1.5 rounded-lg active:scale-95 transition-transform"
+              >
+                SYNC TO DEVICE
+              </button>
+            </div>
+
+            <div class="bg-slate-50 dark:bg-slate-900/50 rounded-2xl p-4 mb-4">
+              <label class="block text-xs font-bold text-slate-400 mb-2"
+                >Timezone (UTC Offset)</label
+              >
+              <select
+                id="sched-tz"
+                class="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-2 text-sm font-bold outline-none focus:border-emerald-500"
+              >
+                <option value="-12">UTC -12:00</option>
+                <option value="-11">UTC -11:00</option>
+                <option value="-10">UTC -10:00</option>
+                <option value="-9">UTC -09:00</option>
+                <option value="-8">UTC -08:00</option>
+                <option value="-7">UTC -07:00</option>
+                <option value="-6">UTC -06:00</option>
+                <option value="-5">UTC -05:00</option>
+                <option value="-4">UTC -04:00</option>
+                <option value="-3">UTC -03:00</option>
+                <option value="-2">UTC -02:00</option>
+                <option value="-1">UTC -01:00</option>
+                <option value="0" selected>UTC +00:00</option>
+                <option value="1">UTC +01:00 (Spain Winter)</option>
+                <option value="2">UTC +02:00 (Spain Summer)</option>
+                <option value="3">UTC +03:00</option>
+                <option value="4">UTC +04:00</option>
+                <option value="5">UTC +05:00</option>
+                <option value="6">UTC +06:00</option>
+                <option value="7">UTC +07:00</option>
+                <option value="8">UTC +08:00</option>
+                <option value="9">UTC +09:00</option>
+                <option value="10">UTC +10:00</option>
+                <option value="11">UTC +11:00</option>
+                <option value="12">UTC +12:00</option>
+              </select>
+            </div>
+
+            <div id="schedule-rows" class="space-y-1">
+              <!-- JS Generated -->
+            </div>
+          </div>
+
+          <!-- SECTION: DANGER ZONE -->
+          <div>
+            <h4
+              class="text-xs font-bold text-red-500 uppercase tracking-widest mb-4"
+            >
+              Danger Zone
+            </h4>
+            <div
+              class="border border-red-100 dark:border-red-900/30 bg-red-50 dark:bg-red-900/10 rounded-2xl p-4"
+            >
+              <p
+                class="text-xs text-red-600 dark:text-red-400 mb-3 font-medium"
+              >
+                Resetting will clear the serial and secret key stored in this
+                browser.
+              </p>
+              <button
+                onclick="confirmReset()"
+                class="w-full py-3 rounded-xl bg-white dark:bg-slate-800 border border-red-200 dark:border-red-900 text-red-500 font-bold hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+              >
+                Reset Credentials
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
+    <!-- SETUP SCREEN -->
     <div
-      id="screen-settings"
+      id="screen-setup"
       class="max-w-md mx-auto h-[100dvh] flex flex-col justify-center p-8 hidden animate-fade-in"
     >
       <div class="flex flex-col items-center mb-10">
@@ -520,6 +707,7 @@
       </button>
     </div>
 
+    <!-- MAIN APP SCREEN -->
     <div
       id="screen-app"
       class="max-w-md mx-auto h-[100dvh] flex flex-col p-6 gap-6 hidden animate-fade-in"
@@ -550,10 +738,22 @@
         <div class="flex flex-col items-end gap-1">
           <div class="flex gap-2">
             <button
-              onclick="openModal()"
-              class="text-[10px] font-bold text-slate-400 hover:text-red-500 transition-colors"
+              onclick="openSettings()"
+              class="text-[10px] font-bold text-slate-400 hover:text-emerald-500 transition-colors flex items-center gap-1"
             >
-              RESET
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                class="h-3 w-3"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+              >
+                <path
+                  fill-rule="evenodd"
+                  d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z"
+                  clip-rule="evenodd"
+                />
+              </svg>
+              SETTINGS
             </button>
             <span id="app-ver" class="text-[10px] font-mono opacity-30"
               >v0.0.0</span

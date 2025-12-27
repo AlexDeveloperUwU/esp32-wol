@@ -1,4 +1,4 @@
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 WIFI_SSID = "WiFi-SSID"
 WIFI_PASS = "WIFI_PASSWORD"
@@ -17,3 +17,5 @@ WOL_PORT = 9
 
 LED_PIN = 2
 LED_SIGNALS = True
+
+TIMETABLE_FILE = "timetable.json"

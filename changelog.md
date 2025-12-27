@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2025-12-27
+### Added
+- **Scheduled Wake:** Added ability to schedule wake events per day of the week.
+- **Timezone Support:** Added configurable timezone offset for correct local time calculation.
+- **Core 0 Scheduler:** Schedule verification runs on Core 0 to prevent blocking MQTT operations.
+- **Enhanced Web UI:** Settings panel is now accessible without resetting. Added Schedule configuration UI.
+- **Persistence:** Schedule and Timezone settings are saved to `timetable.json` or file specified on config to the device.
+
 ## [1.2.0] - 2025-12-28
 ### Added
 - **Extended Stats:** The `USAGE` command now reports Disk usage, RAM usage, CPU Frequency, and Core count.

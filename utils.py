@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import select
 import socket
@@ -11,7 +12,15 @@ import ntptime
 import ubinascii
 import ucryptolib
 
-from config import DEVICE_SERIAL, SECRET_KEY, TOPIC_BASE, WOL_IP, WOL_MAC, WOL_PORT
+from config import (
+    DEVICE_SERIAL,
+    SECRET_KEY,
+    TIMETABLE_FILE,
+    TOPIC_BASE,
+    WOL_IP,
+    WOL_MAC,
+    WOL_PORT,
+)
 
 
 class CryptoManager:
@@ -124,6 +133,56 @@ class SystemTools:
                 cpu_mhz,
             )
         )
+
+
+class ScheduleManager:
+    """
+    <summary>Manages timetable.json reading/writing and wake checks.</summary>
+    """
+
+    @staticmethod
+    def load_schedule():
+        try:
+            with open(TIMETABLE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {"offset": 0, "days": {}}
+
+    @staticmethod
+    def save_schedule(data):
+        try:
+            with open(TIMETABLE_FILE, "w") as f:
+                json.dump(data, f)
+            return True
+        except Exception as e:
+            print("[SCHED] Save error:", e)
+            return False
+
+    @staticmethod
+    def should_wake():
+        """
+        Checks current time against schedule.
+        Returns True if a scheduled wake matches the current minute.
+        """
+        try:
+            data = ScheduleManager.load_schedule()
+            offset_hours = data.get("offset", 0)
+            schedule = data.get("days", {})
+
+            now = time.time()
+            local_ts = now + (offset_hours * 3600)
+            local_tm = time.gmtime(local_ts)
+            day_key = str(local_tm[6])
+            current_hm = "{:02d}:{:02d}".format(local_tm[3], local_tm[4])
+
+            if day_key in schedule:
+                target_time = schedule[day_key]
+                if target_time and target_time == current_hm:
+                    return True
+        except Exception as e:
+            print("[SCHED] Check error:", e)
+
+        return False
 
 
 class WOLService:
