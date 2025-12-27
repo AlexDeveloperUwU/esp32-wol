@@ -6,6 +6,7 @@ import socket
 import struct
 import time
 
+import machine
 import ntptime
 import ubinascii
 import ucryptolib
@@ -98,21 +99,30 @@ class SystemTools:
         import network
 
         gc.collect()
+
         try:
             fs = os.statvfs("/")
             disk_free = fs[0] * fs[3]
         except:
             disk_free = 0
+
         try:
             rssi = network.WLAN(network.STA_IF).status("rssi")
         except:
             rssi = 0
-        return '{"uptime":%d,"mem_free":%d,"mem_alloc":%d,"rssi":%d,"disk_free":%d}' % (
-            int(time.time() - start_time),
-            gc.mem_free(),
-            gc.mem_alloc(),
-            rssi,
-            disk_free,
+
+        cpu_mhz = machine.freq() // 1000000
+
+        return (
+            '{"uptime":%d,"mem_free":%d,"mem_alloc":%d,"rssi":%d,"disk_free":%d,"cpu_freq":%d,"cores":2}'
+            % (
+                int(time.time() - start_time),
+                gc.mem_free(),
+                gc.mem_alloc(),
+                rssi,
+                disk_free,
+                cpu_mhz,
+            )
         )
 
 

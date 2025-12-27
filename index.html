@@ -72,7 +72,7 @@
       }
     </style>
     <script>
-      const APP_VERSION = "1.1.0";
+      const APP_VERSION = "1.2.0";
       const CONFIG = {
         broker: "broker.hivemq.com",
         port: 8884,
@@ -286,7 +286,7 @@
               const ram = Math.round(s.mem_free / 1024);
               const disk = Math.round(s.disk_free / 1024);
               log(
-                `Stats: RSSI ${s.rssi}dBm | Uptime ${Math.round(s.uptime / 3600)}h | RAM ${ram}KB | Disk ${disk}KB`,
+                `Stats: RSSI ${s.rssi}dBm | Uptime ${Math.round(s.uptime / 3600)}h | CPU ${s.cpu_freq}MHz (${s.cores} Cores) | RAM ${ram}KB | Disk ${disk}KB`,
                 "stats",
               );
             } else {
