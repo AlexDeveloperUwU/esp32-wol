@@ -7,111 +7,185 @@
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
     />
     <title>WOL Controller</title>
+    <script>
+      if (
+        localStorage.theme === "dark" ||
+        (!("theme" in localStorage) &&
+          window.matchMedia("(prefers-color-scheme: dark)").matches)
+      ) {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.remove("dark");
+      }
+    </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
     <script>
       tailwind.config = {
+        darkMode: "class",
         theme: {
           extend: {
-            fontFamily: { sans: ["Inter", "sans-serif"] },
-            boxShadow: {
-              glow: "0 0 20px rgba(16, 185, 129, 0.5)",
-              "glow-red": "0 0 20px rgba(239, 68, 68, 0.4)",
+            fontFamily: {
+              sans: ["Inter", "system-ui", "sans-serif"],
+              mono: ["JetBrains Mono", "monospace"],
+            },
+            animation: {
+              "in-down": "inDown 0.3s ease-out forwards",
+              "in-up": "inUp 0.3s ease-out forwards",
+              "fade-in": "fadeIn 0.2s ease-out forwards",
+              "fade-out": "fadeOut 0.2s ease-out forwards",
+            },
+            keyframes: {
+              inDown: {
+                "0%": { transform: "translateY(-20px)", opacity: "0" },
+                "100%": { transform: "translateY(0)", opacity: "1" },
+              },
+              inUp: {
+                "0%": { transform: "translateY(20px)", opacity: "0" },
+                "100%": { transform: "translateY(0)", opacity: "1" },
+              },
+              fadeIn: {
+                "0%": { opacity: "0" },
+                "100%": { opacity: "1" },
+              },
+              fadeOut: {
+                "0%": { opacity: "1" },
+                "100%": { opacity: "0" },
+              },
             },
           },
         },
       };
     </script>
     <style>
-      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800;900&display=swap");
       body {
         -webkit-tap-highlight-color: transparent;
       }
-      .log-panel {
-        background: rgba(241, 245, 249, 0.9);
-        border: 1px solid rgba(226, 232, 240, 0.8);
+      .terminal-scroll::-webkit-scrollbar {
+        width: 4px;
       }
-      @keyframes pulse-ring {
-        0% {
-          box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
-        }
-        70% {
-          box-shadow: 0 0 0 15px rgba(16, 185, 129, 0);
-        }
-        100% {
-          box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
-        }
-      }
-      .status-online-active .icon-container {
-        animation: pulse-ring 2s infinite;
-      }
-      @keyframes shake {
-        0%,
-        100% {
-          transform: translateX(0);
-        }
-        10%,
-        30%,
-        50%,
-        70%,
-        90% {
-          transform: translateX(-5px);
-        }
-        20%,
-        40%,
-        60%,
-        80% {
-          transform: translateX(5px);
-        }
-      }
-      .error-shake {
-        animation: shake 0.5s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+      .terminal-scroll::-webkit-scrollbar-thumb {
+        background: rgba(100, 116, 139, 0.2);
+        border-radius: 10px;
       }
     </style>
     <script>
+      const APP_VERSION = "1.1.0";
       const CONFIG = {
         broker: "broker.hivemq.com",
         port: 8884,
         baseTopic: "remotewol/",
-        secret: "YOUR_LONG_COMPLEX_SECRET_KEY_HERE",
       };
 
-      const MAX_RETRIES = 12;
       let client;
       let currentTopicString = "";
       let pollInterval;
-      let pollAttempts = 0;
       let heartbeatInterval;
       let pongTimeout;
+      let pollAttempts = 0;
+      const MAX_RETRIES = 12;
+
+      let DEVICE_SERIAL = "";
+      let SECRET_KEY = "";
+
+      function loadCredentials() {
+        DEVICE_SERIAL = localStorage.getItem("wol_serial") || "";
+        SECRET_KEY = localStorage.getItem("wol_secret") || "";
+
+        if (!DEVICE_SERIAL || !SECRET_KEY) {
+          showScreen("settings");
+        } else {
+          document.getElementById("input-serial").value = DEVICE_SERIAL;
+          document.getElementById("input-secret").value = SECRET_KEY;
+          showScreen("app");
+          connect();
+        }
+      }
+
+      function saveCredentials() {
+        const s = document.getElementById("input-serial").value.trim();
+        const k = document.getElementById("input-secret").value.trim();
+
+        if (!s || !k) {
+          showToast("Please fill in both fields", true);
+          return;
+        }
+
+        localStorage.setItem("wol_serial", s);
+        localStorage.setItem("wol_secret", k);
+        location.reload();
+      }
+
+      function showToast(msg, isError = false) {
+        const toast = document.getElementById("toast");
+        const toastMsg = document.getElementById("toast-msg");
+        const toastIcon = document.getElementById("toast-icon");
+
+        toastMsg.innerText = msg;
+
+        if (isError) {
+          toast.className =
+            "fixed top-6 left-1/2 -translate-x-1/2 z-50 bg-red-500 text-white px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-in-down";
+          toastIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd" /></svg>`;
+        } else {
+          toast.className =
+            "fixed top-6 left-1/2 -translate-x-1/2 z-50 bg-slate-800 text-white px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-in-down";
+          toastIcon.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>`;
+        }
+
+        toast.classList.remove("hidden");
+        setTimeout(() => {
+          toast.classList.add("hidden");
+        }, 3000);
+      }
+
+      function openModal() {
+        const overlay = document.getElementById("modal-overlay");
+        overlay.classList.remove("hidden");
+        overlay.classList.remove("animate-fade-out");
+        overlay.classList.add("animate-fade-in");
+      }
+
+      function closeModal() {
+        const overlay = document.getElementById("modal-overlay");
+        overlay.classList.remove("animate-fade-in");
+        overlay.classList.add("animate-fade-out");
+        setTimeout(() => {
+          overlay.classList.add("hidden");
+        }, 200);
+      }
+
+      function confirmReset() {
+        localStorage.removeItem("wol_serial");
+        localStorage.removeItem("wol_secret");
+        location.reload();
+      }
+
+      function showScreen(name) {
+        document.getElementById("screen-app").classList.add("hidden");
+        document.getElementById("screen-settings").classList.add("hidden");
+        document.getElementById(`screen-${name}`).classList.remove("hidden");
+      }
 
       function log(msg, type = "info") {
-        const consoleDiv = document.getElementById("console-logs");
+        const consoleDiv = document.getElementById("logs");
         const time = new Date().toLocaleTimeString([], {
           hour12: false,
           hour: "2-digit",
           minute: "2-digit",
           second: "2-digit",
         });
-        let colorClass = "text-slate-600";
-        let borderClass = "border-l-2 border-slate-300";
-        if (type === "error") {
-          colorClass = "text-red-600 font-bold";
-          borderClass = "border-l-2 border-red-500";
-        }
-        if (type === "success") {
-          colorClass = "text-emerald-600 font-bold";
-          borderClass = "border-l-2 border-emerald-500";
-        }
-        if (type === "stats") {
-          colorClass = "text-blue-600 font-mono text-[10px]";
-          borderClass = "border-l-2 border-blue-500";
-        }
-        consoleDiv.innerHTML += `
-                <div class="mb-2 pl-2 ${borderClass} flex flex-col animate-[fadeIn_0.2s_ease-out]">
-                    <span class="text-[9px] font-mono opacity-60 text-slate-500">${time}</span>
-                    <span class="text-[11px] leading-tight ${colorClass}">${msg}</span>
-                </div>`;
+        let color = "text-slate-500 dark:text-slate-400";
+        if (type === "error") color = "text-red-500";
+        if (type === "success") color = "text-emerald-500";
+        if (type === "stats") color = "text-blue-500 dark:text-blue-400";
+
+        const div = document.createElement("div");
+        div.className = "mb-1 leading-tight";
+        div.innerHTML = `<span class="opacity-30 mr-2 tabular-nums">${time}</span><span class="${color}">${msg}</span>`;
+        consoleDiv.appendChild(div);
         consoleDiv.scrollTop = consoleDiv.scrollHeight;
       }
 
@@ -121,386 +195,422 @@
         const m = String(now.getUTCMonth() + 1).padStart(2, "0");
         const d = String(now.getUTCDate()).padStart(2, "0");
         const h = String(now.getUTCHours()).padStart(2, "0");
-        return `${CONFIG.baseTopic}${y}${m}${d}${h}`;
+        return `${CONFIG.baseTopic}${DEVICE_SERIAL}/${y}${m}${d}${h}`;
       }
 
-      function generatePayload(cmd) {
+      function getCipherKey() {
+        return CryptoJS.SHA256(SECRET_KEY);
+      }
+
+      function encryptPayload(plaintext) {
+        const key = getCipherKey();
+        const iv = CryptoJS.lib.WordArray.random(16);
+        const encrypted = CryptoJS.AES.encrypt(plaintext, key, {
+          iv: iv,
+          padding: CryptoJS.pad.Pkcs7,
+          mode: CryptoJS.mode.CBC,
+        });
+        return iv.toString() + ":" + encrypted.ciphertext.toString();
+      }
+
+      function decryptPayload(encryptedStr) {
+        try {
+          const parts = encryptedStr.split(":");
+          if (parts.length !== 2) return null;
+
+          const iv = CryptoJS.enc.Hex.parse(parts[0]);
+          const ciphertext = CryptoJS.enc.Hex.parse(parts[1]);
+          const key = getCipherKey();
+
+          const cipherParams = CryptoJS.lib.CipherParams.create({
+            ciphertext: ciphertext,
+          });
+
+          const decrypted = CryptoJS.AES.decrypt(cipherParams, key, {
+            iv: iv,
+            padding: CryptoJS.pad.Pkcs7,
+            mode: CryptoJS.mode.CBC,
+          });
+
+          return decrypted.toString(CryptoJS.enc.Utf8);
+        } catch (e) {
+          console.error("Decrypt error", e);
+          return null;
+        }
+      }
+
+      function generateSignedCommand(cmd) {
         const ts = Math.floor(Date.now() / 1000).toString();
         const raw = cmd + ts;
-        const sig = CryptoJS.HmacSHA256(raw, CONFIG.secret).toString(
+        const sig = CryptoJS.HmacSHA256(raw, SECRET_KEY).toString(
           CryptoJS.enc.Hex,
         );
         return `${cmd}|${ts}|${sig}`;
       }
 
       function connect() {
-        const clientId = "web-" + new Date().getTime();
-        log(`Initializing secure connection...`);
-        updateConnectionStatus("connecting");
-        client = new Paho.MQTT.Client(CONFIG.broker, CONFIG.port, clientId);
-        client.onConnectionLost = onConnectionLost;
-        client.onMessageArrived = onMessageArrived;
+        updateBrokerStatus("connecting");
+        client = new Paho.MQTT.Client(
+          CONFIG.broker,
+          CONFIG.port,
+          "web-" + Date.now(),
+        );
+
+        client.onConnectionLost = (res) => {
+          updateBrokerStatus("offline");
+          updateEspStatus(false);
+          if (res.errorCode !== 0)
+            log("Connection lost: " + res.errorMessage, "error");
+        };
+
+        client.onMessageArrived = (msg) => {
+          const encryptedPayload = msg.payloadString;
+          const payload = decryptPayload(encryptedPayload);
+
+          if (!payload) {
+            log("Received undecryptable message", "error");
+            return;
+          }
+
+          if (msg.destinationName.includes("/response")) {
+            if (payload === "PONG") {
+              clearTimeout(pongTimeout);
+              updateEspStatus(true);
+            } else if (payload.startsWith("{")) {
+              const s = JSON.parse(payload);
+              log(
+                `Stats: RSSI ${s.rssi}dBm | Uptime ${Math.round(s.uptime / 3600)}h`,
+                "stats",
+              );
+            } else {
+              updatePCStatus(payload);
+              log(
+                "PC Status: " + payload,
+                payload === "ONLINE" ? "success" : "info",
+              );
+              clearInterval(pollInterval);
+            }
+          }
+        };
+
         client.connect({
-          onSuccess: onConnect,
-          onFailure: onFailure,
+          onSuccess: () => {
+            updateBrokerStatus("online");
+            currentTopicString = getUtcTopic();
+            client.subscribe(currentTopicString + "/response");
+            log("Secure Link Active", "success");
+            startHeartbeat();
+            checkStatus();
+          },
+          onFailure: (res) => {
+            updateBrokerStatus("offline");
+            log("Link Failed: " + res.errorMessage, "error");
+          },
           useSSL: true,
-          timeout: 5,
         });
       }
 
-      function onConnect() {
-        updateConnectionStatus("connected");
-        log("Broker Connected.", "success");
-        currentTopicString = getUtcTopic();
-        client.subscribe(currentTopicString + "/response");
-        log("Stabilizing connection (2s)...");
-        setTimeout(() => {
-          startStatusPolling();
-          startHeartbeatLoop();
-        }, 2000);
+      function startHeartbeat() {
+        const ping = () => {
+          if (!client.isConnected()) return;
+          const plain = generateSignedCommand("PING");
+          const msg = new Paho.MQTT.Message(encryptPayload(plain));
+          msg.destinationName = currentTopicString;
+          client.send(msg);
+          pongTimeout = setTimeout(() => updateEspStatus(false), 5000);
+        };
+        ping();
+        setInterval(ping, 30000);
       }
 
-      function onFailure(responseObject) {
-        updateConnectionStatus("disconnected");
-        log(`Connection Failed: ${responseObject.errorMessage}`, "error");
-      }
-
-      function onConnectionLost(responseObject) {
-        updateConnectionStatus("disconnected");
-        if (responseObject.errorCode !== 0) {
-          log(`Connection Drop: ${responseObject.errorMessage}`, "error");
-        }
-        clearInterval(pollInterval);
-        clearInterval(heartbeatInterval);
-      }
-
-      function onMessageArrived(message) {
-        const payload = message.payloadString;
-        if (message.destinationName.includes("/response")) {
-          if (payload === "PONG") {
-            clearTimeout(pongTimeout);
-            updateEspLinkStatus(true);
-            return;
-          }
-          if (payload.startsWith("{")) {
-            try {
-              const stats = JSON.parse(payload);
-              const uptimeHrs = (stats.uptime / 3600).toFixed(1);
-              const freeMemKb = (stats.mem_free / 1024).toFixed(1);
-              log(
-                `[ESP32] Up: ${uptimeHrs}h | Free: ${freeMemKb}kB | Sig: ${stats.rssi}dBm`,
-                "stats",
-              );
-            } catch (e) {
-              log("Raw Stats: " + payload, "info");
-            }
-            return;
-          }
-          clearInterval(pollInterval);
-          pollAttempts = 0;
-          updatePcStatus(payload);
-          log(
-            `Status update: ${payload}`,
-            payload === "ONLINE" ? "success" : "info",
-          );
-        }
-      }
-
-      function startHeartbeatLoop() {
-        if (heartbeatInterval) clearInterval(heartbeatInterval);
-        sendPing();
-        heartbeatInterval = setInterval(sendPing, 30000);
-      }
-
-      function sendPing() {
+      function checkStatus() {
         if (!client.isConnected()) return;
-        publish("PING");
-        if (pongTimeout) clearTimeout(pongTimeout);
-        pongTimeout = setTimeout(() => {
-          updateEspLinkStatus(false);
-          log("ESP32 Heartbeat Missed", "error");
-        }, 5000);
-      }
-
-      function updateEspLinkStatus(isAlive) {
-        const dot = document.getElementById("status-dot");
-        const text = document.getElementById("status-text");
-        if (isAlive) {
-          dot.className =
-            "w-2 h-2 rounded-full transition-all duration-300 bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]";
-          text.innerText = "LINK ACTIVE";
-          text.className =
-            "text-[10px] font-bold tracking-widest text-emerald-600";
-        } else {
-          dot.className =
-            "w-2 h-2 rounded-full transition-all duration-300 bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]";
-          text.innerText = "ESP32 LOST";
-          text.className = "text-[10px] font-bold tracking-widest text-red-600";
-        }
-      }
-
-      function startStatusPolling() {
-        if (!client.isConnected()) return;
-        if (pollInterval) clearInterval(pollInterval);
         pollAttempts = 0;
-        performStatusCheck();
-        pollInterval = setInterval(performStatusCheck, 10000);
-      }
-
-      function performStatusCheck() {
-        if (!client.isConnected()) {
-          clearInterval(pollInterval);
-          return;
-        }
-        if (pollAttempts >= MAX_RETRIES) {
-          clearInterval(pollInterval);
-          updatePcStatus("ESP_ERROR");
-          log("Target PC Unreachable (Max Retries)", "error");
-          return;
-        }
-        pollAttempts++;
-        publish("STATUS");
-      }
-
-      function executeWol() {
-        if (!client.isConnected()) return;
-        log("Transmitting Wake-on-LAN...", "success");
-        publish("WAKE");
-        const btn = document.getElementById("btn-wake");
-        btn.classList.add("scale-[0.98]", "opacity-90");
-        setTimeout(() => {
-          btn.classList.remove("scale-[0.98]", "opacity-90");
-          startStatusPolling();
-        }, 500);
-      }
-
-      function requestUsage() {
-        if (!client.isConnected()) return;
-        log("Requesting System Metrics...", "info");
-        publish("USAGE");
-      }
-
-      function publish(cmd) {
-        const payload = generatePayload(cmd);
-        message = new Paho.MQTT.Message(payload);
-        message.destinationName = currentTopicString;
-        client.send(message);
-      }
-
-      function updateConnectionStatus(status) {
-        const dot = document.getElementById("status-dot");
-        const text = document.getElementById("status-text");
-        dot.className = "w-2 h-2 rounded-full transition-all duration-300";
-        if (status === "connected") {
-          dot.classList.add("bg-amber-500");
-          text.innerText = "WAITING LINK";
-          text.className =
-            "text-[10px] font-bold tracking-widest text-amber-600";
-        } else if (status === "connecting") {
-          dot.classList.add("bg-amber-500", "animate-pulse");
-          text.innerText = "CONNECTING";
-          text.className =
-            "text-[10px] font-bold tracking-widest text-amber-600";
-          toggleWakeButton(false, "ESTABLISHING LINK...");
-        } else {
-          dot.classList.add("bg-red-500");
-          text.innerText = "OFFLINE";
-          text.className = "text-[10px] font-bold tracking-widest text-red-600";
-          toggleWakeButton(false, "NO CONNECTION");
-        }
-      }
-
-      function updatePcStatus(status) {
-        const card = document.getElementById("status-card");
-        const iconContainer = document.querySelector(".icon-container");
-        const statusValue = document.getElementById("pc-status-value");
-        card.classList.remove("status-online-active", "error-shake");
-        if (status === "ESP_ERROR") {
-          card.classList.add("error-shake");
-          iconContainer.className =
-            "icon-container w-32 h-32 rounded-3xl border-2 flex items-center justify-center transition-all duration-500 shadow-xl bg-red-500/10 text-red-500 border-red-500/50";
-          statusValue.innerHTML = "TIMEOUT";
-          statusValue.className =
-            "text-4xl font-black text-red-500 tracking-tighter";
-          toggleWakeButton(false, "CONTROLLER OFFLINE");
-        } else if (status === "ONLINE") {
-          card.classList.add("status-online-active");
-          iconContainer.className =
-            "icon-container w-32 h-32 rounded-3xl border-2 flex items-center justify-center transition-all duration-500 shadow-xl bg-emerald-500/10 text-emerald-500 border-emerald-500/50";
-          statusValue.innerHTML = "ONLINE";
-          statusValue.className =
-            "text-4xl font-black text-slate-800 tracking-tighter drop-shadow-sm";
-          toggleWakeButton(false, "SYSTEM IS ONLINE");
-        } else {
-          iconContainer.className =
-            "icon-container w-32 h-32 rounded-3xl border-2 flex items-center justify-center transition-all duration-500 shadow-xl bg-white text-slate-300 border-slate-200";
-          statusValue.innerHTML = "OFFLINE";
-          statusValue.className =
-            "text-4xl font-black text-slate-400 tracking-tighter";
-          if (client && client.isConnected()) {
-            toggleWakeButton(true, "POWER ON SYSTEM");
+        if (pollInterval) clearInterval(pollInterval);
+        const poll = () => {
+          if (pollAttempts >= MAX_RETRIES) {
+            updatePCStatus("TIMEOUT");
+            clearInterval(pollInterval);
+            return;
           }
-        }
+          pollAttempts++;
+          const plain = generateSignedCommand("STATUS");
+          const msg = new Paho.MQTT.Message(encryptPayload(plain));
+          msg.destinationName = currentTopicString;
+          client.send(msg);
+        };
+        poll();
+        pollInterval = setInterval(poll, 10000);
       }
 
-      function toggleWakeButton(enable, text) {
+      function wake() {
+        log("Sending WAKE signal...", "success");
+        const plain = generateSignedCommand("WAKE");
+        const msg = new Paho.MQTT.Message(encryptPayload(plain));
+        msg.destinationName = currentTopicString;
+        client.send(msg);
+        setTimeout(checkStatus, 1000);
+      }
+
+      function getMetrics() {
+        const plain = generateSignedCommand("USAGE");
+        const msg = new Paho.MQTT.Message(encryptPayload(plain));
+        msg.destinationName = currentTopicString;
+        client.send(msg);
+      }
+
+      function updateBrokerStatus(s) {
+        const el = document.getElementById("ind-broker");
+        if (el)
+          el.className = `w-2 h-2 rounded-full ${s === "online" ? "bg-emerald-500" : s === "connecting" ? "bg-amber-500 animate-pulse" : "bg-red-500"}`;
+      }
+
+      function updateEspStatus(alive) {
+        const el = document.getElementById("ind-esp");
+        if (el)
+          el.className = `w-2 h-2 rounded-full ${alive ? "bg-emerald-500" : "bg-red-500"}`;
+      }
+
+      function updatePCStatus(s) {
+        const text = document.getElementById("pc-status");
         const btn = document.getElementById("btn-wake");
-        const btnText = document.getElementById("btn-text");
-        const btnIcon = document.getElementById("btn-icon");
-        btnText.innerText = text;
-        if (enable) {
-          btn.disabled = false;
-          btn.classList.remove("opacity-50", "cursor-not-allowed", "grayscale");
-          btn.classList.add("shadow-glow", "active:scale-95");
-          btnIcon.classList.remove("hidden");
-        } else {
+        if (text) text.innerText = s;
+
+        if (!btn) return;
+
+        if (s === "ONLINE") {
+          text.className =
+            "text-7xl font-black text-emerald-500 dark:text-emerald-400 tracking-tighter transition-colors duration-500";
           btn.disabled = true;
-          btn.classList.add("opacity-50", "cursor-not-allowed", "grayscale");
-          btn.classList.remove("shadow-glow", "active:scale-95");
-          btnIcon.classList.add("hidden");
+          btn.className =
+            "w-full py-5 rounded-2xl bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-600 font-bold cursor-not-allowed";
+        } else if (s === "TIMEOUT") {
+          text.className =
+            "text-7xl font-black text-red-500 tracking-tighter transition-colors duration-500";
+          btn.disabled = false;
+          btn.className =
+            "w-full py-5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-black shadow-lg shadow-emerald-500/20 active:scale-[0.98] transition-all";
+        } else {
+          text.className =
+            "text-7xl font-black text-slate-300 dark:text-slate-800 tracking-tighter transition-colors duration-500";
+          btn.disabled = false;
+          btn.className =
+            "w-full py-5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-black shadow-lg shadow-emerald-500/20 active:scale-[0.98] transition-all";
         }
       }
 
-      window.onload = connect;
+      function toggleTheme() {
+        if (document.documentElement.classList.contains("dark")) {
+          document.documentElement.classList.remove("dark");
+          localStorage.theme = "light";
+        } else {
+          document.documentElement.classList.add("dark");
+          localStorage.theme = "dark";
+        }
+      }
+
+      window.onload = () => {
+        document.getElementById("app-ver").innerText = `v${APP_VERSION}`;
+        loadCredentials();
+      };
     </script>
   </head>
   <body
-    class="bg-slate-50 h-[100dvh] w-full overflow-hidden text-slate-800 font-sans"
+    class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors duration-300"
   >
-    <div
-      class="absolute top-0 left-0 w-full h-full overflow-hidden -z-10 pointer-events-none"
-    >
-      <div
-        class="absolute top-[-10%] right-[-20%] w-[400px] h-[400px] bg-emerald-300/30 rounded-full blur-[80px]"
-      ></div>
-      <div
-        class="absolute bottom-[-10%] left-[-20%] w-[300px] h-[300px] bg-blue-300/30 rounded-full blur-[80px]"
-      ></div>
+    <div id="toast" class="hidden">
+      <div id="toast-icon"></div>
+      <span id="toast-msg" class="font-bold text-sm"></span>
     </div>
-    <main
-      class="h-full max-w-lg mx-auto p-6 flex flex-col justify-between relative z-10"
+
+    <div
+      id="modal-overlay"
+      class="fixed inset-0 z-50 bg-slate-900/40 dark:bg-black/60 backdrop-blur-sm hidden flex items-center justify-center p-6 animate-fade-in"
     >
-      <header class="flex justify-between items-center pt-2">
-        <div>
-          <h1
-            class="text-2xl font-black tracking-tight flex items-center gap-1 text-slate-800"
-          >
-            WOL
-            <div class="w-1.5 h-1.5 bg-emerald-500 rounded-full mt-3"></div>
-            <span class="font-light opacity-60">Mobile</span>
-          </h1>
-          <div class="flex items-center gap-2 mt-1">
-            <div
-              id="status-dot"
-              class="w-2 h-2 rounded-full bg-slate-300"
-            ></div>
-            <span
-              id="status-text"
-              class="text-[10px] font-bold tracking-widest text-slate-400 uppercase"
-              >Init...</span
-            >
-          </div>
-        </div>
-        <button
-          onclick="requestUsage()"
-          class="p-2 rounded-full bg-white/50 border border-slate-200 shadow-sm active:scale-95 transition-all text-slate-400 hover:text-blue-500"
-        >
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="h-5 w-5"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
-            />
-          </svg>
-        </button>
-      </header>
-      <section
-        id="status-card"
-        class="flex-1 flex flex-col items-center justify-center gap-6 my-6 transition-all duration-500"
+      <div
+        class="bg-white dark:bg-slate-900 w-full max-w-sm rounded-3xl p-6 shadow-2xl border border-slate-100 dark:border-slate-800 animate-in-up"
       >
-        <div
-          class="icon-container w-32 h-32 rounded-3xl border-2 border-slate-200 bg-white flex items-center justify-center text-slate-300 transition-all duration-500 shadow-xl"
-        >
-          <svg
-            id="pc-icon"
-            xmlns="http://www.w3.org/2000/svg"
-            class="h-16 w-16"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="1.5"
+        <h3 class="text-xl font-black tracking-tight mb-2">Reset Settings?</h3>
+        <p class="text-sm text-slate-500 dark:text-slate-400 mb-6 font-medium">
+          This will clear your stored serial number and secret key. You will
+          need to enter them again.
+        </p>
+        <div class="flex gap-3">
+          <button
+            onclick="closeModal()"
+            class="flex-1 py-3 rounded-xl bg-slate-100 dark:bg-slate-800 font-bold text-slate-500 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
           >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
-            />
-          </svg>
-        </div>
-        <div class="text-center">
-          <p class="text-xs font-bold text-slate-400 tracking-[0.2em] mb-1">
-            CURRENT STATUS
-          </p>
-          <h2
-            id="pc-status-value"
-            class="text-4xl font-black text-slate-400 tracking-tighter transition-all duration-300"
+            Cancel
+          </button>
+          <button
+            onclick="confirmReset()"
+            class="flex-1 py-3 rounded-xl bg-red-500 font-bold text-white hover:bg-red-600 transition-colors shadow-lg shadow-red-500/20"
           >
-            WAITING
-          </h2>
-        </div>
-      </section>
-      <div class="flex flex-col gap-4">
-        <button
-          id="btn-wake"
-          onclick="executeWol()"
-          disabled
-          class="w-full h-16 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-400 text-white shadow-lg flex items-center justify-center gap-3 transition-all duration-300 disabled:opacity-50 disabled:grayscale hover:shadow-emerald-200"
-        >
-          <svg
-            id="btn-icon"
-            xmlns="http://www.w3.org/2000/svg"
-            class="h-6 w-6 hidden animate-bounce"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              stroke-width="2"
-              d="M13 10V3L4 14h7v7l9-11h-7z"
-            />
-          </svg>
-          <span id="btn-text" class="font-bold tracking-wide text-lg"
-            >CONNECTING...</span
-          >
-        </button>
-        <div class="relative">
-          <div class="flex justify-between items-end mb-2 px-1">
-            <span
-              class="text-[9px] font-bold text-slate-400 uppercase tracking-widest"
-              >Event Log</span
-            >
-            <button
-              onclick="startStatusPolling()"
-              class="text-[9px] text-emerald-600 font-bold hover:underline"
-            >
-              CHECK NOW
-            </button>
-          </div>
-          <div
-            id="console-logs"
-            class="log-panel h-32 rounded-xl p-3 overflow-y-auto scrollbar-hide text-slate-600"
-          ></div>
+            Confirm
+          </button>
         </div>
       </div>
-    </main>
+    </div>
+
+    <div
+      id="screen-settings"
+      class="max-w-md mx-auto h-[100dvh] flex flex-col justify-center p-8 hidden animate-fade-in"
+    >
+      <div class="flex flex-col items-center mb-10">
+        <div
+          class="w-16 h-16 bg-white dark:bg-slate-900 rounded-3xl flex items-center justify-center mb-6 shadow-sm border border-slate-200 dark:border-slate-800"
+        >
+          <div class="w-6 h-6 bg-emerald-500 rounded-full animate-pulse"></div>
+        </div>
+        <h1 class="text-4xl font-black tracking-tighter">SETUP</h1>
+        <p
+          class="text-xs font-bold text-slate-400 uppercase tracking-widest mt-2"
+        >
+          Configuration Required
+        </p>
+      </div>
+
+      <div class="space-y-6 w-full">
+        <div class="space-y-2">
+          <label
+            class="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1"
+            >Device Serial</label
+          >
+          <input
+            type="text"
+            id="input-serial"
+            placeholder="e.g. ESP32-01"
+            class="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 text-lg font-bold outline-none focus:border-emerald-500 transition-colors placeholder:font-normal placeholder:text-slate-300 dark:placeholder:text-slate-700"
+          />
+        </div>
+        <div class="space-y-2">
+          <label
+            class="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1"
+            >Secret Key</label
+          >
+          <input
+            type="password"
+            id="input-secret"
+            placeholder="••••••••"
+            class="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 text-lg font-bold outline-none focus:border-emerald-500 transition-colors placeholder:font-normal placeholder:text-slate-300 dark:placeholder:text-slate-700"
+          />
+        </div>
+      </div>
+
+      <button
+        onclick="saveCredentials()"
+        class="mt-10 w-full py-6 rounded-2xl bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-black tracking-wide shadow-xl active:scale-95 transition-all"
+      >
+        START CONTROLLER
+      </button>
+    </div>
+
+    <div
+      id="screen-app"
+      class="max-w-md mx-auto h-[100dvh] flex flex-col p-6 gap-6 hidden animate-fade-in"
+    >
+      <header class="flex justify-between items-center">
+        <div>
+          <h1 class="text-2xl font-black tracking-tighter">WOL REMOTE</h1>
+          <div class="flex gap-4 mt-1">
+            <div class="flex items-center gap-1.5">
+              <div
+                id="ind-broker"
+                class="w-2 h-2 rounded-full bg-slate-300"
+              ></div>
+              <span
+                class="text-[10px] font-bold text-slate-400 uppercase tracking-widest"
+                >Broker</span
+              >
+            </div>
+            <div class="flex items-center gap-1.5">
+              <div id="ind-esp" class="w-2 h-2 rounded-full bg-slate-300"></div>
+              <span
+                class="text-[10px] font-bold text-slate-400 uppercase tracking-widest"
+                >ESP32</span
+              >
+            </div>
+          </div>
+        </div>
+        <div class="flex flex-col items-end gap-1">
+          <div class="flex gap-2">
+            <button
+              onclick="openModal()"
+              class="text-[10px] font-bold text-slate-400 hover:text-red-500 transition-colors"
+            >
+              RESET
+            </button>
+            <span id="app-ver" class="text-[10px] font-mono opacity-30"
+              >v0.0.0</span
+            >
+          </div>
+          <button
+            onclick="toggleTheme()"
+            class="w-8 h-4 bg-slate-200 dark:bg-slate-800 rounded-full relative transition-colors"
+          >
+            <div
+              class="absolute left-1 dark:left-auto dark:right-1 top-1 w-2 h-2 bg-slate-500 dark:bg-emerald-500 rounded-full transition-all"
+            ></div>
+          </button>
+        </div>
+      </header>
+
+      <section class="flex-1 flex flex-col items-center justify-center">
+        <span
+          class="text-[11px] font-black text-slate-400 dark:text-slate-600 uppercase tracking-[0.4em] mb-4"
+          >System Status</span
+        >
+        <div
+          id="pc-status"
+          class="text-7xl font-black text-slate-300 dark:text-slate-800 tracking-tighter transition-all duration-500"
+        >
+          INIT...
+        </div>
+      </section>
+
+      <div class="space-y-4">
+        <button
+          id="btn-wake"
+          onclick="wake()"
+          class="w-full py-5 rounded-2xl bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-600 font-bold transition-all"
+        >
+          SEND MAGIC PACKET
+        </button>
+
+        <div class="grid grid-cols-2 gap-4">
+          <button
+            onclick="checkStatus()"
+            class="py-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-[11px] font-bold uppercase tracking-widest active:bg-slate-50 dark:active:bg-slate-800 transition-colors"
+          >
+            Refresh
+          </button>
+          <button
+            onclick="getMetrics()"
+            class="py-3 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-[11px] font-bold uppercase tracking-widest active:bg-slate-50 dark:active:bg-slate-800 transition-colors"
+          >
+            Metrics
+          </button>
+        </div>
+      </div>
+
+      <div class="flex flex-col min-h-0">
+        <div class="flex justify-between items-center mb-2 px-1">
+          <span
+            class="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest"
+            >Activity Log</span
+          >
+          <button
+            onclick="document.getElementById('logs').innerHTML = ''"
+            class="text-[10px] font-bold text-emerald-500 opacity-60 hover:opacity-100"
+          >
+            CLEAR
+          </button>
+        </div>
+        <div
+          id="logs"
+          class="terminal-scroll h-48 bg-slate-100 dark:bg-slate-900/50 rounded-2xl p-4 font-mono text-[11px] overflow-y-auto border border-slate-200 dark:border-slate-800/50"
+        ></div>
+      </div>
+    </div>
   </body>
 </html>
