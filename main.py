@@ -1,4 +1,5 @@
 import gc
+import os
 import time
 
 import machine
@@ -91,16 +92,23 @@ def get_system_stats():
     mem_alloc = gc.mem_alloc()
 
     try:
+        fs = os.statvfs("/")
+        disk_free = fs[0] * fs[3]
+    except:
+        disk_free = 0
+
+    try:
         wlan = network.WLAN(network.STA_IF)
         rssi = wlan.status("rssi")
     except:
         rssi = 0
 
-    return '{"uptime":%d,"mem_free":%d,"mem_alloc":%d,"rssi":%d}' % (
+    return '{"uptime":%d,"mem_free":%d,"mem_alloc":%d,"rssi":%d,"disk_free":%d}' % (
         uptime_s,
         mem_free,
         mem_alloc,
         rssi,
+        disk_free,
     )
 
 

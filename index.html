@@ -85,6 +85,7 @@
       let heartbeatInterval;
       let pongTimeout;
       let pollAttempts = 0;
+      let isConnecting = false;
       const MAX_RETRIES = 12;
 
       let DEVICE_SERIAL = "";
@@ -249,6 +250,9 @@
       }
 
       function connect() {
+        if (isConnecting) return;
+        isConnecting = true;
+
         updateBrokerStatus("connecting");
         client = new Paho.MQTT.Client(
           CONFIG.broker,
@@ -257,6 +261,7 @@
         );
 
         client.onConnectionLost = (res) => {
+          isConnecting = false;
           updateBrokerStatus("offline");
           updateEspStatus(false);
           if (res.errorCode !== 0)
@@ -278,8 +283,10 @@
               updateEspStatus(true);
             } else if (payload.startsWith("{")) {
               const s = JSON.parse(payload);
+              const ram = Math.round(s.mem_free / 1024);
+              const disk = Math.round(s.disk_free / 1024);
               log(
-                `Stats: RSSI ${s.rssi}dBm | Uptime ${Math.round(s.uptime / 3600)}h`,
+                `Stats: RSSI ${s.rssi}dBm | Uptime ${Math.round(s.uptime / 3600)}h | RAM ${ram}KB | Disk ${disk}KB`,
                 "stats",
               );
             } else {
@@ -289,20 +296,27 @@
                 payload === "ONLINE" ? "success" : "info",
               );
               clearInterval(pollInterval);
+              pollInterval = null;
             }
           }
         };
 
         client.connect({
           onSuccess: () => {
+            isConnecting = false;
             updateBrokerStatus("online");
             currentTopicString = getUtcTopic();
             client.subscribe(currentTopicString + "/response");
             log("Secure Link Active", "success");
+
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            if (pollInterval) clearInterval(pollInterval);
+
             startHeartbeat();
-            checkStatus();
+            setTimeout(checkStatus, 500);
           },
           onFailure: (res) => {
+            isConnecting = false;
             updateBrokerStatus("offline");
             log("Link Failed: " + res.errorMessage, "error");
           },
@@ -312,7 +326,7 @@
 
       function startHeartbeat() {
         const ping = () => {
-          if (!client.isConnected()) return;
+          if (!client || !client.isConnected()) return;
           const plain = generateSignedCommand("PING");
           const msg = new Paho.MQTT.Message(encryptPayload(plain));
           msg.destinationName = currentTopicString;
@@ -320,17 +334,18 @@
           pongTimeout = setTimeout(() => updateEspStatus(false), 5000);
         };
         ping();
-        setInterval(ping, 30000);
+        heartbeatInterval = setInterval(ping, 30000);
       }
 
       function checkStatus() {
-        if (!client.isConnected()) return;
+        if (!client || !client.isConnected()) return;
         pollAttempts = 0;
         if (pollInterval) clearInterval(pollInterval);
         const poll = () => {
           if (pollAttempts >= MAX_RETRIES) {
             updatePCStatus("TIMEOUT");
             clearInterval(pollInterval);
+            pollInterval = null;
             return;
           }
           pollAttempts++;
