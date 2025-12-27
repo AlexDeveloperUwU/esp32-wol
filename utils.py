@@ -51,7 +51,7 @@ class CryptoManager:
             cipher = ucryptolib.aes(self.key, 2, iv)
             return self._unpad(cipher.decrypt(ciphertext)).decode()
         except:
-            print("[SEC] Decryption failed: Invalid format or key mismatch")
+            print("[SEC] Decryption failed: format/key error")
             return None
 
     def verify_signature(self, cmd, timestamp, signature):
@@ -62,7 +62,7 @@ class CryptoManager:
             ).hexdigest()
             match = calc_sig == signature
             if not match:
-                print("[SEC] Signature mismatch for cmd:", cmd)
+                print("[SEC] Signature mismatch:", cmd)
             return match
         except:
             return False
@@ -79,7 +79,7 @@ class SystemTools:
         try:
             ntptime.host = "pool.ntp.org"
             ntptime.settime()
-            print("[NTP] Success. UTC Time:", time.gmtime())
+            print("[NTP] Success. UTC:", time.gmtime())
             return True
         except Exception as e:
             print("[NTP] Failed:", e)
@@ -123,7 +123,7 @@ class WOLService:
 
     @staticmethod
     def send_magic_packet():
-        print(f"[WOL] Sending Magic Packet to {WOL_MAC} via {WOL_IP}...")
+        print(f"[WOL] Targeting {WOL_MAC}...")
         try:
             mac_bytes = ubinascii.unhexlify(WOL_MAC.replace(":", "").replace("-", ""))
             payload = b"\xff" * 6 + mac_bytes * 16
@@ -131,7 +131,7 @@ class WOLService:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.sendto(payload, (WOL_IP, WOL_PORT))
             sock.close()
-            print("[WOL] Packet transmitted.")
+            print("[WOL] Sent.")
         except Exception as e:
             print("[WOL] Error:", e)
 
@@ -154,21 +154,24 @@ class WOLService:
 
     @staticmethod
     def ping_device(host):
-        print(f"[PING] Testing connectivity to {host}...")
+        print(f"[PING] {host}...")
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)
-            sock.setblocking(0)
+            sock.settimeout(2.0)
             header = struct.pack("!BBHHH", 8, 0, 0, 0x1234, 1)
             data = struct.pack("d", time.time())
             chk = WOLService._get_checksum(header + data)
             header = struct.pack("!BBHHH", 8, 0, chk, 0x1234, 1)
             addr = socket.getaddrinfo(host, 1)[0][-1]
             sock.sendto(header + data, addr)
-            ready = select.select([sock], [], [], 2)
-            sock.close()
+            ready = select.select([sock], [], [], 2.0)
             result = True if ready[0] else False
             print(f"[PING] Result: {'ONLINE' if result else 'OFFLINE'}")
             return result
         except Exception as e:
             print("[PING] Error:", e)
             return False
+        finally:
+            if sock:
+                sock.close()

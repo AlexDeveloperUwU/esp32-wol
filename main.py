@@ -1,3 +1,4 @@
+import _thread
 import gc
 import time
 
@@ -10,7 +11,7 @@ from utils import CryptoManager, SystemTools, WOLService
 
 class LEDController:
     """
-    <summary>Manages physical LED patterns for system feedback.</summary>
+    <summary>Handles LED blinking on Core 0 thread to ensure smooth pulses.</summary>
     """
 
     BOOT = 100
@@ -22,30 +23,17 @@ class LEDController:
     def __init__(self):
         self.enabled = config.LED_SIGNALS
         self.pin = None
+        self.mode = self.BOOT
+        self.state = 0
         if self.enabled:
             try:
                 self.pin = machine.Pin(config.LED_PIN, machine.Pin.OUT)
                 self.pin.value(0)
             except:
                 self.enabled = False
-        self.state = 0
-        self.last_tick = 0
-        self.mode = self.BOOT
 
     def set_mode(self, mode):
         self.mode = mode
-
-    def update(self):
-        if not self.enabled:
-            return
-        now = time.ticks_ms()
-        interval = self.mode
-        if self.mode == self.IDLE_ON or self.mode == self.IDLE_OFF:
-            interval = self.IDLE_ON if self.state == 1 else self.IDLE_OFF
-        if time.ticks_diff(now, self.last_tick) > interval:
-            self.state = 1 - self.state
-            self.pin.value(self.state)
-            self.last_tick = now
 
     def flash(self, count):
         if not self.enabled:
@@ -56,10 +44,31 @@ class LEDController:
             self.pin.value(0)
             time.sleep(0.05)
 
+    def _run_thread(self):
+        last_tick = 0
+        while True:
+            if not self.enabled:
+                time.sleep(2)
+                continue
+
+            now = time.ticks_ms()
+            interval = self.mode
+            if self.mode in [self.IDLE_ON, self.IDLE_OFF]:
+                interval = self.IDLE_ON if self.state == 1 else self.IDLE_OFF
+
+            if time.ticks_diff(now, last_tick) > interval:
+                self.state = 1 - self.state
+                self.pin.value(self.state)
+                last_tick = now
+            time.sleep(0.05)
+
+    def start(self):
+        _thread.start_new_thread(self._run_thread, ())
+
 
 class WOLApp:
     """
-    <summary>Main application class managing the MQTT client and system loop.</summary>
+    <summary>Main Logic on Core 1. Manages MQTT and system integrity.</summary>
     """
 
     def __init__(self):
@@ -76,7 +85,7 @@ class WOLApp:
         try:
             self.wdt = machine.WDT(timeout=15000)
         except:
-            print("[SYS] WDT not supported on this hardware.")
+            print("[SYS] WDT not available.")
 
     def _feed(self):
         if self.wdt:
@@ -84,17 +93,13 @@ class WOLApp:
 
     def _on_message(self, topic, msg):
         self.led.flash(1)
-        raw_payload = msg.decode()
-        print(f"\n[RX] Message on {topic.decode()}")
-
-        decrypted = self.crypto.decrypt(raw_payload)
-        if not decrypted:
-            return
-
         try:
+            decrypted = self.crypto.decrypt(msg.decode())
+            if not decrypted:
+                return
+
             parts = decrypted.split("|")
             if len(parts) != 3:
-                print("[ERR] Invalid packet structure")
                 return
 
             cmd, ts, sig = parts[0], parts[1], parts[2]
@@ -102,13 +107,11 @@ class WOLApp:
                 return
 
             current_ts = time.time() + 946684800
-            if abs(current_ts - int(ts)) > 60:
-                print(
-                    f"[ERR] Replay/Time sync error. Diff: {abs(current_ts - int(ts))}s"
-                )
+            if abs(current_ts - int(ts)) > 120:
+                print(f"[ERR] Time skew: {abs(current_ts - int(ts))}s")
                 return
 
-            print(f"[OK] Command: {cmd} (TS: {ts})")
+            print(f"[OK] Cmd: {cmd}")
             resp_topic = self.current_topic + "/response"
 
             if cmd == "WAKE":
@@ -126,17 +129,15 @@ class WOLApp:
             elif cmd == "USAGE":
                 metrics = SystemTools.get_metrics(self.start_time)
                 self._publish(resp_topic, metrics)
-                print("[TX] Usage metrics sent.")
                 self.led.flash(2)
 
         except Exception as e:
-            print("[ERR] Callback exception:", e)
+            print("[ERR] Callback error:", e)
 
     def _publish(self, topic, payload):
         enc = self.crypto.encrypt(payload)
         if enc:
             self.client.publish(topic, enc)
-            print(f"[TX] Response sent to {topic}")
 
     def _connect_mqtt(self):
         print(f"[MQTT] Connecting to {config.MQTT_BROKER}...")
@@ -149,46 +150,46 @@ class WOLApp:
         )
         self.client.set_callback(self._on_message)
         self.client.connect()
-
         self.current_topic = SystemTools.get_dynamic_topic()
         self.client.subscribe(self.current_topic)
-        print(f"[MQTT] Connected and subscribed to: {self.current_topic}")
+        print(f"[MQTT] Subscribed: {self.current_topic}")
         self.led.set_mode(LEDController.IDLE_ON)
 
     def run(self):
-        print(f"--- ESP32 WOL v{config.VERSION} ---")
+        print(f"--- ESP32 SECURE WOL v{config.VERSION} ---")
+        self.led.start()
         self._setup_wdt()
         gc.enable()
 
         if not SystemTools.sync_time():
-            print("[CRIT] Cannot proceed without time sync. Resetting...")
-            time.sleep(2)
+            print("[CRIT] No NTP. Rebooting...")
+            time.sleep(5)
             machine.reset()
 
         self.start_time = time.time()
+        self.last_mqtt_ping = time.time()
 
         try:
             self._connect_mqtt()
         except Exception as e:
-            print("[CRIT] MQTT Connection failed:", e)
-            time.sleep(5)
+            print("[CRIT] Init Error:", e)
+            self.led.set_mode(LEDController.ERROR)
+            time.sleep(10)
             machine.reset()
 
-        print("[SYS] System entering main loop.")
+        print("[SYS] Entering Main Loop (Core 1).")
         while True:
             self._feed()
-            self.led.update()
-
             try:
                 if time.time() - self.start_time > 43200:
-                    print("[SYS] Scheduled 12h maintenance reboot...")
+                    print("[SYS] Maintenance reboot.")
                     machine.reset()
 
                 self.client.check_msg()
 
                 new_topic = SystemTools.get_dynamic_topic()
                 if new_topic != self.current_topic:
-                    print(f"[MQTT] Rotating topic: {new_topic}")
+                    print(f"[MQTT] Rotating...")
                     try:
                         self.client.unsubscribe(self.current_topic)
                     except:
@@ -201,12 +202,12 @@ class WOLApp:
                     self.client.ping()
                     self.last_mqtt_ping = time.time()
 
-                time.sleep(0.05)
+                time.sleep(0.2)
 
             except Exception as e:
-                print(f"[ERR] Runtime error: {e}")
+                print(f"[ERR] Runtime Loop: {e}")
                 self.led.set_mode(LEDController.ERROR)
-                time.sleep(5)
+                time.sleep(10)
                 machine.reset()
 
 
