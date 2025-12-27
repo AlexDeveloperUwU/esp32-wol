@@ -1,287 +1,215 @@
 import gc
-import os
 import time
 
 import machine
-import network
 from umqtt.robust import MQTTClient
 
-from config import LED_PIN, MQTT_BROKER, MQTT_CLIENT_ID, MQTT_PORT, WOL_IP, WOL_MAC
-from utils import (
-    encrypt_payload,
-    get_dynamic_topic,
-    ping_device,
-    send_magic_packet,
-    sync_time,
-    verify_and_parse_msg,
-)
-
-STATUS_BOOT = 0
-STATUS_CONNECTING = 1
-STATUS_IDLE = 2
-STATUS_ERROR = 3
-
-current_status = STATUS_BOOT
-last_led_tick = 0
-led_state = 0
-wdt = None
-
-try:
-    led = machine.Pin(LED_PIN, machine.Pin.OUT)
-    led.value(0)
-except:
-    led = None
-
-current_topic = ""
-client = None
-last_ping = 0
-start_time = 0
+import config
+from utils import CryptoManager, SystemTools, WOLService
 
 
-def feed_wdt():
-    if wdt:
-        wdt.feed()
+class LEDController:
+    """
+    <summary>Manages physical LED patterns for system feedback.</summary>
+    """
 
+    BOOT = 100
+    CONNECTING = 300
+    ERROR = 50
+    IDLE_ON = 50
+    IDLE_OFF = 4000
 
-def set_status(status):
-    global current_status
-    current_status = status
+    def __init__(self):
+        self.enabled = config.LED_SIGNALS
+        self.pin = None
+        if self.enabled:
+            try:
+                self.pin = machine.Pin(config.LED_PIN, machine.Pin.OUT)
+                self.pin.value(0)
+            except:
+                self.enabled = False
+        self.state = 0
+        self.last_tick = 0
+        self.mode = self.BOOT
 
+    def set_mode(self, mode):
+        self.mode = mode
 
-def update_led():
-    global last_led_tick, led_state
-    if not led:
-        return
+    def update(self):
+        if not self.enabled:
+            return
+        now = time.ticks_ms()
+        interval = self.mode
+        if self.mode == self.IDLE_ON or self.mode == self.IDLE_OFF:
+            interval = self.IDLE_ON if self.state == 1 else self.IDLE_OFF
+        if time.ticks_diff(now, self.last_tick) > interval:
+            self.state = 1 - self.state
+            self.pin.value(self.state)
+            self.last_tick = now
 
-    now = time.ticks_ms()
-    interval = 0
-
-    if current_status == STATUS_BOOT:
-        interval = 100
-    elif current_status == STATUS_CONNECTING:
-        interval = 300
-    elif current_status == STATUS_ERROR:
-        interval = 50
-    elif current_status == STATUS_IDLE:
-        if led_state == 1:
-            interval = 50
-        else:
-            interval = 4000
-
-    if time.ticks_diff(now, last_led_tick) > interval:
-        led_state = 1 - led_state
-        led.value(led_state)
-        last_led_tick = now
-
-
-def flash_signal(count):
-    if not led:
-        return
-    for _ in range(count):
-        led.value(1)
-        time.sleep(0.05)
-        led.value(0)
-        time.sleep(0.05)
-    feed_wdt()
-
-
-def get_system_stats():
-    gc.collect()
-    uptime_s = int(time.time() - start_time)
-    mem_free = gc.mem_free()
-    mem_alloc = gc.mem_alloc()
-
-    try:
-        fs = os.statvfs("/")
-        disk_free = fs[0] * fs[3]
-    except:
-        disk_free = 0
-
-    try:
-        wlan = network.WLAN(network.STA_IF)
-        rssi = wlan.status("rssi")
-    except:
-        rssi = 0
-
-    return '{"uptime":%d,"mem_free":%d,"mem_alloc":%d,"rssi":%d,"disk_free":%d}' % (
-        uptime_s,
-        mem_free,
-        mem_alloc,
-        rssi,
-        disk_free,
-    )
-
-
-def publish_encrypted(topic, payload):
-    encrypted = encrypt_payload(payload)
-    if encrypted:
-        client.publish(topic, encrypted)
-
-
-def sub_callback(topic, msg):
-    flash_signal(1)
-
-    try:
-        topic_str = topic.decode()
-        payload_str = msg.decode("utf-8")
-
-        print(f"\n[RX] Message on: {topic_str}")
-
-        cmd, ts = verify_and_parse_msg(payload_str)
-
-        if cmd == "WAKE":
-            print(f"[OK] WAKE (TS: {ts})")
-            send_magic_packet()
-            flash_signal(3)
-            print("[TX] Magic Packet Sent")
-
-        elif cmd == "STATUS":
-            print(f"[OK] STATUS (TS: {ts})")
-            is_online = ping_device(WOL_IP)
-            resp = "ONLINE" if is_online else "OFFLINE"
-            resp_topic = current_topic + "/response"
-            publish_encrypted(resp_topic, resp)
-            flash_signal(2)
-
-        elif cmd == "PING":
-            print(f"[OK] HEARTBEAT PING RECEIVED")
-            resp_topic = current_topic + "/response"
-            publish_encrypted(resp_topic, "PONG")
-            flash_signal(1)
-
-        elif cmd == "USAGE":
-            print(f"[OK] USAGE STATS REQUEST")
-            stats = get_system_stats()
-            resp_topic = current_topic + "/response"
-            print(f"[TX] {stats}")
-            publish_encrypted(resp_topic, stats)
-            flash_signal(2)
-
-        elif cmd is None:
-            print("[!!] Decryption Failed or Invalid Signature")
-            set_status(STATUS_ERROR)
-            time.sleep(1)
-            set_status(STATUS_IDLE)
-
-    except Exception as e:
-        print(f"[!!] Callback Exception: {e}")
-
-    feed_wdt()
-
-
-def get_mqtt_client():
-    set_status(STATUS_CONNECTING)
-    print(f"[..] Connecting to MQTT Broker: {MQTT_BROKER}...")
-
-    c = MQTTClient(MQTT_CLIENT_ID, MQTT_BROKER, port=MQTT_PORT, keepalive=60)
-    c.set_callback(sub_callback)
-    c.DEBUG = True
-    c.connect()
-    print("[OK] MQTT Connected.")
-    return c
-
-
-def main_loop():
-    global client, current_topic, last_ping, start_time, wdt
-
-    set_status(STATUS_BOOT)
-
-    try:
-        wdt = machine.WDT(timeout=15000)
-    except:
-        print("[WARN] WDT not available")
-
-    feed_wdt()
-    gc.enable()
-    gc.collect()
-
-    print("[..] Syncing NTP time...")
-    if sync_time():
-        print("[OK] Time Synced.")
-    else:
-        print("[!!] NTP Sync Failed. Rebooting...")
-        set_status(STATUS_ERROR)
-        time.sleep(2)
-        machine.reset()
-
-    start_time = time.time()
-    feed_wdt()
-
-    try:
-        client = get_mqtt_client()
-        current_topic = get_dynamic_topic()
-        client.subscribe(current_topic)
-        print(f"[OK] Subscribed: {current_topic}")
-        set_status(STATUS_IDLE)
-        last_ping = time.time()
-
-    except Exception as e:
-        print(f"[!!] Connection Failed: {e}")
-        set_status(STATUS_ERROR)
-        time.sleep(3)
-        machine.reset()
-
-    while True:
-        feed_wdt()
-
-        try:
-            update_led()
-            gc.collect()
-
-            if time.time() - start_time > 43200:
-                print("[..] Scheduled 12h Reboot...")
-                try:
-                    client.disconnect()
-                except:
-                    pass
-                time.sleep(1)
-                machine.reset()
-
-            client.check_msg()
-
-            new_topic = get_dynamic_topic()
-            if new_topic != current_topic:
-                print(f"[..] Rotating Topic: {current_topic} -> {new_topic}")
-                try:
-                    client.unsubscribe(current_topic)
-                except:
-                    pass
-                current_topic = new_topic
-                client.subscribe(current_topic)
-                sync_time()
-                print("[OK] Topic Rotated")
-
-            if time.time() - last_ping > 30:
-                client.ping()
-                last_ping = time.time()
-
+    def flash(self, count):
+        if not self.enabled:
+            return
+        for _ in range(count):
+            self.pin.value(1)
+            time.sleep(0.05)
+            self.pin.value(0)
             time.sleep(0.05)
 
-        except OSError as e:
-            print(f"[!!] MQTT Error: {e}")
-            set_status(STATUS_CONNECTING)
-            try:
-                client.disconnect()
-            except:
-                pass
-            try:
-                feed_wdt()
-                time.sleep(2)
-                feed_wdt()
-                client.connect()
-                client.subscribe(current_topic)
-                set_status(STATUS_IDLE)
-            except:
-                set_status(STATUS_ERROR)
-                time.sleep(2)
-                machine.reset()
+
+class WOLApp:
+    """
+    <summary>Main application class managing the MQTT client and system loop.</summary>
+    """
+
+    def __init__(self):
+        self.led = LEDController()
+        self.crypto = CryptoManager()
+        self.client = None
+        self.current_topic = ""
+        self.start_time = 0
+        self.last_mqtt_ping = 0
+        self.wdt = None
+
+    def _setup_wdt(self):
+        print("[SYS] Initializing Watchdog (15s)...")
+        try:
+            self.wdt = machine.WDT(timeout=15000)
+        except:
+            print("[SYS] WDT not supported on this hardware.")
+
+    def _feed(self):
+        if self.wdt:
+            self.wdt.feed()
+
+    def _on_message(self, topic, msg):
+        self.led.flash(1)
+        raw_payload = msg.decode()
+        print(f"\n[RX] Message on {topic.decode()}")
+
+        decrypted = self.crypto.decrypt(raw_payload)
+        if not decrypted:
+            return
+
+        try:
+            parts = decrypted.split("|")
+            if len(parts) != 3:
+                print("[ERR] Invalid packet structure")
+                return
+
+            cmd, ts, sig = parts[0], parts[1], parts[2]
+            if not self.crypto.verify_signature(cmd, ts, sig):
+                return
+
+            current_ts = time.time() + 946684800
+            if abs(current_ts - int(ts)) > 60:
+                print(
+                    f"[ERR] Replay/Time sync error. Diff: {abs(current_ts - int(ts))}s"
+                )
+                return
+
+            print(f"[OK] Command: {cmd} (TS: {ts})")
+            resp_topic = self.current_topic + "/response"
+
+            if cmd == "WAKE":
+                WOLService.send_magic_packet()
+                self.led.flash(3)
+            elif cmd == "STATUS":
+                status = (
+                    "ONLINE" if WOLService.ping_device(config.WOL_IP) else "OFFLINE"
+                )
+                self._publish(resp_topic, status)
+                self.led.flash(2)
+            elif cmd == "PING":
+                self._publish(resp_topic, "PONG")
+                self.led.flash(1)
+            elif cmd == "USAGE":
+                metrics = SystemTools.get_metrics(self.start_time)
+                self._publish(resp_topic, metrics)
+                print("[TX] Usage metrics sent.")
+                self.led.flash(2)
 
         except Exception as e:
-            print(f"[!!] Critical Error: {e}")
-            set_status(STATUS_ERROR)
+            print("[ERR] Callback exception:", e)
+
+    def _publish(self, topic, payload):
+        enc = self.crypto.encrypt(payload)
+        if enc:
+            self.client.publish(topic, enc)
+            print(f"[TX] Response sent to {topic}")
+
+    def _connect_mqtt(self):
+        print(f"[MQTT] Connecting to {config.MQTT_BROKER}...")
+        self.led.set_mode(LEDController.CONNECTING)
+        self.client = MQTTClient(
+            config.MQTT_CLIENT_ID,
+            config.MQTT_BROKER,
+            port=config.MQTT_PORT,
+            keepalive=60,
+        )
+        self.client.set_callback(self._on_message)
+        self.client.connect()
+
+        self.current_topic = SystemTools.get_dynamic_topic()
+        self.client.subscribe(self.current_topic)
+        print(f"[MQTT] Connected and subscribed to: {self.current_topic}")
+        self.led.set_mode(LEDController.IDLE_ON)
+
+    def run(self):
+        print(f"--- ESP32 WOL v{config.VERSION} ---")
+        self._setup_wdt()
+        gc.enable()
+
+        if not SystemTools.sync_time():
+            print("[CRIT] Cannot proceed without time sync. Resetting...")
             time.sleep(2)
             machine.reset()
 
+        self.start_time = time.time()
+
+        try:
+            self._connect_mqtt()
+        except Exception as e:
+            print("[CRIT] MQTT Connection failed:", e)
+            time.sleep(5)
+            machine.reset()
+
+        print("[SYS] System entering main loop.")
+        while True:
+            self._feed()
+            self.led.update()
+
+            try:
+                if time.time() - self.start_time > 43200:
+                    print("[SYS] Scheduled 12h maintenance reboot...")
+                    machine.reset()
+
+                self.client.check_msg()
+
+                new_topic = SystemTools.get_dynamic_topic()
+                if new_topic != self.current_topic:
+                    print(f"[MQTT] Rotating topic: {new_topic}")
+                    try:
+                        self.client.unsubscribe(self.current_topic)
+                    except:
+                        pass
+                    self.current_topic = new_topic
+                    self.client.subscribe(self.current_topic)
+                    SystemTools.sync_time()
+
+                if time.time() - self.last_mqtt_ping > 30:
+                    self.client.ping()
+                    self.last_mqtt_ping = time.time()
+
+                time.sleep(0.05)
+
+            except Exception as e:
+                print(f"[ERR] Runtime error: {e}")
+                self.led.set_mode(LEDController.ERROR)
+                time.sleep(5)
+                machine.reset()
+
 
 if __name__ == "__main__":
-    main_loop()
+    app = WOLApp()
+    app.run()

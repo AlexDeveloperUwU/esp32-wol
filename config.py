@@ -16,3 +16,4 @@ WOL_IP = "192.168.1.1"
 WOL_PORT = 9
 
 LED_PIN = 2
+LED_SIGNALS = True

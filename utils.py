@@ -13,156 +13,162 @@ import ucryptolib
 from config import DEVICE_SERIAL, SECRET_KEY, TOPIC_BASE, WOL_IP, WOL_MAC, WOL_PORT
 
 
-def sync_time():
-    try:
-        ntptime.host = "pool.ntp.org"
-        ntptime.settime()
-        return True
-    except:
-        return False
+class CryptoManager:
+    """
+    <summary>Handles AES encryption/decryption and HMAC signature verification.</summary>
+    """
 
+    def __init__(self):
+        self.key = hashlib.sha256(SECRET_KEY.encode()).digest()
 
-def get_dynamic_topic():
-    t = time.gmtime()
-    time_str = "{:04d}{:02d}{:02d}{:02d}".format(t[0], t[1], t[2], t[3])
-    return "{}{}/{}".format(TOPIC_BASE, DEVICE_SERIAL, time_str)
+    def _pad(self, data):
+        block_size = 16
+        padding = block_size - len(data) % block_size
+        return data + (chr(padding) * padding).encode()
 
+    def _unpad(self, data):
+        return data[: -data[-1]]
 
-def get_cipher_key():
-    return hashlib.sha256(SECRET_KEY.encode()).digest()
+    def encrypt(self, plaintext):
+        try:
+            iv = os.urandom(16)
+            cipher = ucryptolib.aes(self.key, 2, iv)
+            encrypted = cipher.encrypt(self._pad(plaintext.encode()))
+            return (
+                ubinascii.hexlify(iv) + b":" + ubinascii.hexlify(encrypted)
+            ).decode()
+        except Exception as e:
+            print("[SEC] Encryption error:", e)
+            return ""
 
-
-def pad(data):
-    block_size = 16
-    padding = block_size - len(data) % block_size
-    return data + (chr(padding) * padding).encode()
-
-
-def unpad(data):
-    padding = data[-1]
-    return data[:-padding]
-
-
-def encrypt_payload(plaintext):
-    try:
-        key = get_cipher_key()
-        iv = os.urandom(16)
-        cipher = ucryptolib.aes(key, 2, iv)
-        padded_txt = pad(plaintext.encode())
-        encrypted = cipher.encrypt(padded_txt)
-        return (ubinascii.hexlify(iv) + b":" + ubinascii.hexlify(encrypted)).decode()
-    except Exception as e:
-        print(f"Encrypt error: {e}")
-        return ""
-
-
-def decrypt_payload(encrypted_str):
-    try:
-        parts = encrypted_str.split(":")
-        if len(parts) != 2:
+    def decrypt(self, encrypted_str):
+        try:
+            parts = encrypted_str.split(":")
+            if len(parts) != 2:
+                return None
+            iv = ubinascii.unhexlify(parts[0])
+            ciphertext = ubinascii.unhexlify(parts[1])
+            cipher = ucryptolib.aes(self.key, 2, iv)
+            return self._unpad(cipher.decrypt(ciphertext)).decode()
+        except:
+            print("[SEC] Decryption failed: Invalid format or key mismatch")
             return None
 
-        iv = ubinascii.unhexlify(parts[0])
-        ciphertext = ubinascii.unhexlify(parts[1])
-        key = get_cipher_key()
-
-        cipher = ucryptolib.aes(key, 2, iv)
-        decrypted_padded = cipher.decrypt(ciphertext)
-        return unpad(decrypted_padded).decode()
-    except Exception as e:
-        print(f"Decrypt error: {e}")
-        return None
-
-
-def verify_and_parse_msg(encrypted_msg):
-    decrypted_str = decrypt_payload(encrypted_msg)
-    if not decrypted_str:
-        return None, None
-
-    try:
-        parts = decrypted_str.split("|")
-        if len(parts) != 3:
-            return None, None
-
-        cmd, timestamp, signature = parts[0], parts[1], parts[2]
-        msg_ts = int(timestamp)
-
-        current_ts = time.time() + 946684800
-
-        if abs(current_ts - msg_ts) > 60:
-            print(f"Time diff error: ESP={current_ts} MSG={msg_ts}")
-            return None, None
-
-        check_str = cmd + timestamp
-        calc_sig = hmac.new(
-            SECRET_KEY.encode(), check_str.encode(), hashlib.sha256
-        ).hexdigest()
-
-        if calc_sig != signature:
-            print("Invalid Signature")
-            return None, None
-
-        return cmd, timestamp
-    except Exception as e:
-        print(f"Parse error: {e}")
-        return None, None
+    def verify_signature(self, cmd, timestamp, signature):
+        try:
+            check_str = cmd + timestamp
+            calc_sig = hmac.new(
+                SECRET_KEY.encode(), check_str.encode(), hashlib.sha256
+            ).hexdigest()
+            match = calc_sig == signature
+            if not match:
+                print("[SEC] Signature mismatch for cmd:", cmd)
+            return match
+        except:
+            return False
 
 
-def send_magic_packet():
-    mac_bytes = ubinascii.unhexlify(WOL_MAC.replace(":", "").replace("-", ""))
-    payload = b"\xff" * 6 + mac_bytes * 16
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.sendto(payload, (WOL_IP, WOL_PORT))
-    sock.close()
+class SystemTools:
+    """
+    <summary>Utility class for system time, topic generation, and metrics.</summary>
+    """
 
-
-def get_checksum(source):
-    checksum = 0
-    count = (len(source) // 2) * 2
-    i = 0
-    while i < count:
-        temp = source[i + 1] * 256 + source[i]
-        checksum = checksum + temp
-        checksum = checksum & 0xFFFFFFFF
-        i = i + 2
-    if i < len(source):
-        checksum = checksum + source[len(source) - 1]
-        checksum = checksum & 0xFFFFFFFF
-    checksum = (checksum >> 16) + (checksum & 0xFFFF)
-    checksum = checksum + (checksum >> 16)
-    answer = ~checksum
-    answer = answer & 0xFFFF
-    answer = answer >> 8 | (answer << 8 & 0xFF00)
-    return answer
-
-
-def ping_device(host):
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)
-        sock.setblocking(0)
-
-        pkt_id = 0x1234
-        pkt_seq = 1
-        pkt_type = 8
-        pkt_code = 0
-        pkt_chk = 0
-
-        header = struct.pack("!BBHHH", pkt_type, pkt_code, pkt_chk, pkt_id, pkt_seq)
-        data = struct.pack("d", time.time())
-        pkt_chk = get_checksum(header + data)
-        header = struct.pack("!BBHHH", pkt_type, pkt_code, pkt_chk, pkt_id, pkt_seq)
-        packet = header + data
-
-        addr = socket.getaddrinfo(host, 1)[0][-1]
-        sock.sendto(packet, addr)
-
-        ready = select.select([sock], [], [], 2)
-        if ready[0]:
-            sock.close()
+    @staticmethod
+    def sync_time():
+        print("[NTP] Syncing with pool.ntp.org...")
+        try:
+            ntptime.host = "pool.ntp.org"
+            ntptime.settime()
+            print("[NTP] Success. UTC Time:", time.gmtime())
             return True
+        except Exception as e:
+            print("[NTP] Failed:", e)
+            return False
 
-        sock.close()
-        return False
-    except:
-        return False
+    @staticmethod
+    def get_dynamic_topic():
+        t = time.gmtime()
+        time_str = "{:04d}{:02d}{:02d}{:02d}".format(t[0], t[1], t[2], t[3])
+        return "{}{}/{}".format(TOPIC_BASE, DEVICE_SERIAL, time_str)
+
+    @staticmethod
+    def get_metrics(start_time):
+        import gc
+
+        import network
+
+        gc.collect()
+        try:
+            fs = os.statvfs("/")
+            disk_free = fs[0] * fs[3]
+        except:
+            disk_free = 0
+        try:
+            rssi = network.WLAN(network.STA_IF).status("rssi")
+        except:
+            rssi = 0
+        return '{"uptime":%d,"mem_free":%d,"mem_alloc":%d,"rssi":%d,"disk_free":%d}' % (
+            int(time.time() - start_time),
+            gc.mem_free(),
+            gc.mem_alloc(),
+            rssi,
+            disk_free,
+        )
+
+
+class WOLService:
+    """
+    <summary>Provides network services for Wake-on-LAN and ICMP Ping.</summary>
+    """
+
+    @staticmethod
+    def send_magic_packet():
+        print(f"[WOL] Sending Magic Packet to {WOL_MAC} via {WOL_IP}...")
+        try:
+            mac_bytes = ubinascii.unhexlify(WOL_MAC.replace(":", "").replace("-", ""))
+            payload = b"\xff" * 6 + mac_bytes * 16
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.sendto(payload, (WOL_IP, WOL_PORT))
+            sock.close()
+            print("[WOL] Packet transmitted.")
+        except Exception as e:
+            print("[WOL] Error:", e)
+
+    @staticmethod
+    def _get_checksum(source):
+        checksum = 0
+        count = (len(source) // 2) * 2
+        i = 0
+        while i < count:
+            checksum += source[i + 1] * 256 + source[i]
+            checksum &= 0xFFFFFFFF
+            i += 2
+        if i < len(source):
+            checksum += source[len(source) - 1]
+            checksum &= 0xFFFFFFFF
+        checksum = (checksum >> 16) + (checksum & 0xFFFF)
+        checksum += checksum >> 16
+        answer = ~checksum & 0xFFFF
+        return answer >> 8 | (answer << 8 & 0xFF00)
+
+    @staticmethod
+    def ping_device(host):
+        print(f"[PING] Testing connectivity to {host}...")
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)
+            sock.setblocking(0)
+            header = struct.pack("!BBHHH", 8, 0, 0, 0x1234, 1)
+            data = struct.pack("d", time.time())
+            chk = WOLService._get_checksum(header + data)
+            header = struct.pack("!BBHHH", 8, 0, chk, 0x1234, 1)
+            addr = socket.getaddrinfo(host, 1)[0][-1]
+            sock.sendto(header + data, addr)
+            ready = select.select([sock], [], [], 2)
+            sock.close()
+            result = True if ready[0] else False
+            print(f"[PING] Result: {'ONLINE' if result else 'OFFLINE'}")
+            return result
+        except Exception as e:
+            print("[PING] Error:", e)
+            return False
